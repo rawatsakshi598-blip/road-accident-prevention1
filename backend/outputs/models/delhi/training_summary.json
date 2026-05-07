@@ -1,0 +1,132 @@
+{
+  "dataset": "delhi",
+  "pipeline": "delhi_trainer",
+  "timestamp": "2026-04-30T23:53:21.797335",
+  "total_pipeline_time_sec": 13.71,
+  "total_segments": 255,
+  "train_size_original": 204,
+  "train_size_after_smote": 432,
+  "test_size": 51,
+  "n_features": 15,
+  "feature_names": [
+    "total_accidents",
+    "fatal_count",
+    "grievous_count",
+    "minor_count",
+    "fatal_rate",
+    "accident_density",
+    "weighted_severity",
+    "length_m",
+    "num_years",
+    "year_span",
+    "day_accident_ratio",
+    "is_highway",
+    "is_urban",
+    "is_intersection",
+    "is_virtual"
+  ],
+  "label_mapping": {
+    "0": "High",
+    "1": "Low",
+    "2": "Medium"
+  },
+  "models_trained": [],
+  "models_failed": [
+    "XGBoost",
+    "GradientBoosting",
+    "RandomForest",
+    "SVM",
+    "LogisticRegression"
+  ],
+  "best_model": null,
+  "best_f1_weighted": 0.0,
+  "model_results": {
+    "XGBoost": {
+      "accuracy": 0.9804,
+      "f1_weighted": 0.9773,
+      "f1_macro": 0.8843,
+      "roc_auc": 1.0,
+      "cohens_kappa": 0.9536,
+      "mcc": 0.9549,
+      "cv_mean": 0.9954,
+      "cv_std": 0.0057,
+      "training_time": 3.14,
+      "best_params": {
+        "subsample": "1.0",
+        "n_estimators": "500",
+        "max_depth": "6",
+        "learning_rate": "0.01",
+        "colsample_bytree": "0.7"
+      },
+      "error": null
+    },
+    "GradientBoosting": {
+      "accuracy": 1.0,
+      "f1_weighted": 1.0,
+      "f1_macro": 1.0,
+      "roc_auc": 1.0,
+      "cohens_kappa": 1.0,
+      "mcc": 1.0,
+      "cv_mean": 0.993,
+      "cv_std": 0.0057,
+      "training_time": 5.71,
+      "best_params": {
+        "n_estimators": "100",
+        "max_depth": "3",
+        "learning_rate": "0.01"
+      },
+      "error": null
+    },
+    "RandomForest": {
+      "accuracy": 0.9608,
+      "f1_weighted": 0.9417,
+      "f1_macro": 0.6498,
+      "roc_auc": 1.0,
+      "cohens_kappa": 0.9062,
+      "mcc": 0.9096,
+      "cv_mean": 0.9953,
+      "cv_std": 0.0057,
+      "training_time": 3.99,
+      "best_params": {
+        "n_estimators": "300",
+        "min_samples_split": "2",
+        "max_depth": "None"
+      },
+      "error": null
+    },
+    "SVM": {
+      "accuracy": 0.9608,
+      "f1_weighted": 0.9577,
+      "f1_macro": 0.8587,
+      "roc_auc": 0.9966,
+      "cohens_kappa": 0.9071,
+      "mcc": 0.9084,
+      "cv_mean": 0.9977,
+      "cv_std": 0.0033,
+      "training_time": 0.09,
+      "best_params": {
+        "kernel": "rbf",
+        "gamma": "0.1",
+        "C": "100"
+      },
+      "error": null
+    },
+    "LogisticRegression": {
+      "accuracy": 0.9412,
+      "f1_weighted": 0.9411,
+      "f1_macro": 0.8069,
+      "roc_auc": 0.9949,
+      "cohens_kappa": 0.8675,
+      "mcc": 0.8684,
+      "cv_mean": 0.9885,
+      "cv_std": 0.0146,
+      "training_time": 0.65,
+      "best_params": {
+        "solver": "liblinear",
+        "penalty": "l1",
+        "C": "100"
+      },
+      "error": null
+    }
+  }
+}

@@ -171,34 +171,42 @@ async def get_heatmap(
 ):
     """
     Get heatmap data for visualization.
-    
-    Types:
-    - grid: Regular grid with risk intensity (for heatmap.js)
-    - segments: Road segments with risk data, colors, and accident counts
-      
-    Segment response includes:
-    - segment_id, road_name, road_type, centroid_lat, centroid_lon
-    - total_accidents, fatal_count, grievous_count, minor_count
-    - composite_risk (0-100), risk_category, risk_color
-    - is_virtual (boolean for virtual segments from GPS points)
     """
     twin = get_twin(city_key)
-    
+
     if type not in ["grid", "segments"]:
         raise HTTPException(
             status_code=400,
             detail="Invalid type. Use 'grid' or 'segments'"
         )
-    
+
     try:
-        # Use the new API-formatted response method
         heatmap_data = twin.get_heatmap_api_response(
             heatmap_type=type,
             risk_threshold=risk_threshold
         )
-        
+
+        # ── NORMALIZE for frontend compatibility ──
+        if isinstance(heatmap_data, dict) and "data" in heatmap_data:
+            normalized = []
+            for seg in heatmap_data["data"]:
+                if not isinstance(seg, dict):
+                    normalized.append(seg)
+                    continue
+                # Fix 1: ensure risk_score field exists
+                if "risk_score" not in seg or seg.get("risk_score", 0) == 0:
+                    seg["risk_score"] = seg.get("composite_risk", seg.get("risk_score", 0))
+                # Fix 2: ensure centroid array exists for circle markers
+                if "centroid" not in seg or seg["centroid"] is None:
+                    lat = seg.get("centroid_lat")
+                    lon = seg.get("centroid_lon")
+                    if lat is not None and lon is not None:
+                        seg["centroid"] = [lat, lon]
+                normalized.append(seg)
+            heatmap_data["data"] = normalized
+
         return heatmap_data
-        
+
     except Exception as e:
         logger.error(f"Heatmap generation failed: {e}")
         raise HTTPException(

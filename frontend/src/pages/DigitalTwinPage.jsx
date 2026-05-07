@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { MapContainer, TileLayer, Polyline, CircleMarker, Popup, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Polyline, Popup, useMap } from 'react-leaflet';
 import { motion } from 'framer-motion';
 import {
   FiMap, FiRefreshCw, FiAlertTriangle,
-  FiActivity, FiInfo, FiFilter, FiDatabase, FiLayers
+  FiActivity, FiInfo, FiDatabase, FiLayers
 } from 'react-icons/fi';
 import toast from 'react-hot-toast';
 
@@ -52,6 +52,21 @@ const getSegmentWeight = (seg) => {
   if (score >= 40) return 4;
   if (score >= 10) return 3;
   return 2;
+};
+
+
+const getGlowWeight = (seg) => {
+  const base = getSegmentWeight(seg);
+  return base + 8;
+};
+
+const getGlowOpacity = (seg) => {
+  const score = seg.risk_score ?? 0;
+  if (score >= 80) return 0.85;
+  if (score >= 60) return 0.75;
+  if (score >= 40) return 0.65;
+  if (score >= 10) return 0.55;
+  return 0.40;
 };
 
 const getRiskCategory = (score) => {
@@ -185,7 +200,7 @@ const DigitalTwinPage = () => {
   const [detailSegment,    setDetailSegment]    = useState(null);
   const [loading,          setLoading]          = useState(false);
   const [mapLoading,       setMapLoading]       = useState(false);
-  const [riskFilter,       setRiskFilter]       = useState(0);
+  const [riskFilter,       setRiskFilter]       = useState('all');
   const [sidebarTab,       setSidebarTab]       = useState('stats');
   const [mapKey,           setMapKey]           = useState('map-initial');
   const [mapReady,         setMapReady]         = useState(false);
@@ -231,11 +246,8 @@ const DigitalTwinPage = () => {
 
       if (heatmapRes.status === 'fulfilled') {
         const allSegs = heatmapRes.value.data?.data || [];
-        const sorted = [...allSegs].sort(
-          (a, b) => (b.risk_score ?? 0) - (a.risk_score ?? 0)
-        );
-        setSegments(sorted);
-        console.log(`Loaded ${sorted.length} segments for ${cityKey}`);
+        setSegments(allSegs);
+        console.log(`Loaded ${allSegs.length} segments for ${cityKey}`);
       }
       if (statsRes.status === 'fulfilled') {
         const d = statsRes.value.data;
@@ -321,7 +333,25 @@ const DigitalTwinPage = () => {
 
   // ── filtered + capped segments for map ───────────────────────────────────────
   const filteredSegments = useMemo(() => {
-    const filtered = segments.filter((s) => (s.risk_score ?? 0) >= riskFilter);
+    const filtered = segments.filter((s) => {
+      const score = s.risk_score ?? 0;
+
+      switch (riskFilter) {
+        case 'zero':
+          return score >= 0 && score < 10;
+        case 'low':
+          return score >= 10 && score < 40;
+        case 'moderate':
+          return score >= 40 && score < 60;
+        case 'high':
+          return score >= 60 && score < 80;
+        case 'vhigh':
+          return score >= 80;
+        default:
+          return true; // all
+      }
+    });
+
     if (selectedSegment) {
       const sel = segments.find((s) => s.segment_id === selectedSegment);
       if (sel && !filtered.find((s) => s.segment_id === sel.segment_id)) {
@@ -332,7 +362,26 @@ const DigitalTwinPage = () => {
   }, [segments, riskFilter, selectedSegment]);
 
   const totalFiltered = useMemo(
-    () => segments.filter((s) => (s.risk_score ?? 0) >= riskFilter).length,
+    () => {
+      return segments.filter((s) => {
+        const score = s.risk_score ?? 0;
+
+        switch (riskFilter) {
+          case 'zero':
+            return score >= 0 && score < 10;
+          case 'low':
+            return score >= 10 && score < 40;
+          case 'moderate':
+            return score >= 40 && score < 60;
+          case 'high':
+            return score >= 60 && score < 80;
+          case 'vhigh':
+            return score >= 80;
+          default:
+            return true;
+        }
+      }).length;
+    },
     [segments, riskFilter]
   );
 
@@ -403,24 +452,21 @@ const DigitalTwinPage = () => {
         <div className="flex items-center gap-4 flex-wrap">
           <div className="flex items-center gap-3">
             <label className="text-xs text-pbi-muted whitespace-nowrap">
-              Show Risk ≥ <span className="text-white font-bold">{riskFilter}%</span>
+              Filter: <span className="text-white font-bold">
+                {riskFilter === 'all' ? 'All' : riskFilter.toUpperCase()}
+              </span>
             </label>
-            <input
-              type="range" min={0} max={90} step={10}
-              value={riskFilter}
-              onChange={(e) => setRiskFilter(Number(e.target.value))}
-              className="w-28 accent-pbi-blue"
-            />
           </div>
 
-          {/* Quick filter buttons with vibrant color scheme */}
+          {/* Exact category filter buttons */}
           <div className="flex gap-1.5 flex-wrap">
             {[
-              { label: 'All',              value: 0,  col: 'text-pbi-muted'   },
-              { label: 'Low+ 10%',         value: 10, col: 'text-blue-400'    },
-              { label: 'Mod+ 40%',         value: 40, col: 'text-yellow-400'  },
-              { label: 'High 60%',         value: 60, col: 'text-orange-400'  },
-              { label: 'V.High 80%',       value: 80, col: 'text-red-400'    },
+              { label: 'All',       value: 'all',      col: 'text-pbi-muted'   },
+              { label: 'Zero',      value: 'zero',     col: 'text-green-400'   },
+              { label: 'Low',       value: 'low',      col: 'text-blue-400'    },
+              { label: 'Moderate',  value: 'moderate', col: 'text-yellow-400'  },
+              { label: 'High',      value: 'high',     col: 'text-orange-400'  },
+              { label: 'V.High',    value: 'vhigh',    col: 'text-red-400'     },
             ].map((f) => (
               <button
                 key={f.value}
@@ -478,7 +524,7 @@ const DigitalTwinPage = () => {
         </div>
 
         {/* Performance warning */}
-        {riskFilter === 0 && segments.length > 1000 && (
+        {riskFilter === 'all' && segments.length > 1000 && (
           <p className="mt-2 text-xs text-pbi-yellow flex items-center gap-1">
             ⚡ Showing top {MAX_MAP_SEGMENTS} of {segments.length.toLocaleString()} segments.
             Use filters above to see specific risk levels.
@@ -512,7 +558,7 @@ const DigitalTwinPage = () => {
                 center={[cityCenter.lat, cityCenter.lng]}
                 zoom={cityZoom}
                 style={{ height: '100%', width: '100%' }}
-                preferCanvas={true}
+                preferCanvas={false}
                 zoomAnimation={false}
                 markerZoomAnimation={false}
                 updateWhenZooming={false}
@@ -525,114 +571,124 @@ const DigitalTwinPage = () => {
                 />
                 <MapRecenter center={cityCenter} zoom={cityZoom} />
 
-                {filteredSegments.map((seg, idx) => {
-                  const coords = seg.coordinates;
-                  const hasValidCoords = coords && Array.isArray(coords) && coords.length >= 2
-                    && coords[0] && coords[0].length >= 2
-                    && typeof coords[0][0] === 'number' && typeof coords[0][1] === 'number';
+                
+{filteredSegments.map((seg, idx) => {
+  const coords = Array.isArray(seg.coordinates)
+    ? seg.coordinates.filter((pt) =>
+        Array.isArray(pt) &&
+        pt.length >= 2 &&
+        typeof pt[0] === 'number' &&
+        typeof pt[1] === 'number'
+      )
+    : [];
 
-                  const color       = getSegmentColor(seg);
-                  const weight      = getSegmentWeight(seg);
-                  const isSelected  = selectedSegment === seg.segment_id;
-                  const riskScore   = seg.risk_score ?? 0;
-                  const category    = seg.risk_category || getRiskCategory(riskScore);
-                  const accidents   = seg.total_accidents ?? seg.accident_count ?? 0;
+  const color = getSegmentColor(seg);
+  const weight = getSegmentWeight(seg);
+  const isSelected = selectedSegment === seg.segment_id;
+  const riskScore = seg.risk_score ?? 0;
+  const category = seg.risk_category || getRiskCategory(riskScore);
+  const accidents = seg.total_accidents ?? seg.accident_count ?? 0;
 
-                  // Compute centroid for circle marker
-                  const centroid = seg.centroid
-                    ? (Array.isArray(seg.centroid) ? seg.centroid : [seg.centroid.lat ?? seg.centroid[0], seg.centroid.lng ?? seg.centroid[1]])
-                    : computeCentroid(coords);
+  // Fallback line if coordinates are somehow missing
+  const centroid = seg.centroid
+    ? (Array.isArray(seg.centroid)
+        ? seg.centroid
+        : [seg.centroid.lat ?? seg.centroid[0], seg.centroid.lng ?? seg.centroid[1]])
+    : computeCentroid(coords);
 
-                  const circleRadius = getCircleRadius(seg);
+  const displayCoords = coords.length >= 2
+    ? coords
+    : (centroid
+        ? [
+            [centroid[0] - 0.0002, centroid[1] - 0.0002],
+            [centroid[0] + 0.0002, centroid[1] + 0.0002],
+          ]
+        : []);
 
-                  // Popup content shared by both polyline and circle marker
-                  const popupContent = (
-                    <div style={{ minWidth: 200, fontFamily: 'sans-serif' }}>
-                      <p style={{ fontWeight: 700, fontSize: 13, margin: '0 0 3px', color: '#111' }}>
-                        {seg.road_name || seg.name || 'Unnamed Road'}
-                      </p>
-                      <p style={{ fontSize: 11, color: '#666', margin: '0 0 6px' }}>
-                        {seg.road_type || seg.road_category || 'Unknown type'}
-                      </p>
-                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
-                        <span style={{ fontSize: 11, color: '#666' }}>Risk Score</span>
-                        <span style={{ fontSize: 13, fontWeight: 700, color }}>
-                          {riskScore.toFixed(1)}%
-                        </span>
-                      </div>
-                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
-                        <span style={{ fontSize: 11, color: '#666' }}>Category</span>
-                        <span style={{ fontSize: 11, fontWeight: 600, color }}>
-                          {category}
-                        </span>
-                      </div>
-                      {accidents > 0 && (
-                        <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
-                          <span style={{ fontSize: 11, color: '#666' }}>Accidents</span>
-                          <span style={{ fontSize: 11, fontWeight: 600, color: '#333' }}>
-                            {accidents}
-                          </span>
-                        </div>
-                      )}
-                      {seg.length_m != null && (
-                        <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
-                          <span style={{ fontSize: 11, color: '#666' }}>Length</span>
-                          <span style={{ fontSize: 11, color: '#333' }}>
-                            {(seg.length_m / 1000).toFixed(2)} km
-                          </span>
-                        </div>
-                      )}
-                      {seg.segment_id && (
-                        <div style={{ display:'flex', justifyContent:'space-between' }}>
-                          <span style={{ fontSize: 11, color: '#666' }}>Segment ID</span>
-                          <span style={{ fontSize: 10, color: '#999', fontFamily: 'monospace' }}>
-                            {seg.segment_id}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  );
+  const popupContent = (
+    <div style={{ minWidth: 200, fontFamily: 'sans-serif' }}>
+      <p style={{ fontWeight: 700, fontSize: 13, margin: '0 0 3px', color: '#111' }}>
+        {seg.road_name || seg.name || 'Unnamed Road'}
+      </p>
+      <p style={{ fontSize: 11, color: '#666', margin: '0 0 6px' }}>
+        {seg.road_type || seg.road_category || 'Unknown type'}
+      </p>
+      <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+        <span style={{ fontSize: 11, color: '#666' }}>Risk Score</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color }}>
+          {riskScore.toFixed(1)}%
+        </span>
+      </div>
+      <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+        <span style={{ fontSize: 11, color: '#666' }}>Category</span>
+        <span style={{ fontSize: 11, fontWeight: 600, color }}>
+          {category}
+        </span>
+      </div>
+      {accidents > 0 && (
+        <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+          <span style={{ fontSize: 11, color: '#666' }}>Accidents</span>
+          <span style={{ fontSize: 11, fontWeight: 600, color: '#333' }}>
+            {accidents}
+          </span>
+        </div>
+      )}
+      {seg.length_m != null && (
+        <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+          <span style={{ fontSize: 11, color: '#666' }}>Length</span>
+          <span style={{ fontSize: 11, color: '#333' }}>
+            {(seg.length_m / 1000).toFixed(2)} km
+          </span>
+        </div>
+      )}
+      {seg.segment_id && (
+        <div style={{ display:'flex', justifyContent:'space-between' }}>
+          <span style={{ fontSize: 11, color: '#666' }}>Segment ID</span>
+          <span style={{ fontSize: 10, color: '#999', fontFamily: 'monospace' }}>
+            {seg.segment_id}
+          </span>
+        </div>
+      )}
+    </div>
+  );
 
-                  return (
-                    <React.Fragment key={seg.segment_id || `seg-${idx}`}>
-                      {/* Polyline for road segment */}
-                      {hasValidCoords && (
-                        <Polyline
-                          positions={coords}
-                          pathOptions={{
-                            color:   isSelected ? '#60A5FA' : color,
-                            weight:  isSelected ? weight + 3 : weight,
-                            opacity: isSelected ? 1.0 : 0.85,
-                          }}
-                          eventHandlers={{
-                            click: () => fetchSegmentDetail(seg),
-                          }}
-                        >
-                          <Popup>{popupContent}</Popup>
-                        </Polyline>
-                      )}
+  return (
+    <React.Fragment key={seg.segment_id || `seg-${idx}`}>
+      {displayCoords.length >= 2 && (
+        <>
+          {/* soft glow */}
+          <Polyline
+            positions={displayCoords}
+            pathOptions={{
+              color,
+              weight: Math.max(6, weight + 6),
+              opacity: isSelected ? 0.35 : 0.18,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }}
+          />
+          {/* main road line */}
+          <Polyline
+            positions={displayCoords}
+            pathOptions={{
+              color: isSelected ? '#FFFFFF' : color,
+              weight: isSelected ? Math.max(5, weight + 2) : Math.max(3, weight),
+              opacity: 0.98,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }}
+            eventHandlers={{
+              click: () => fetchSegmentDetail(seg),
+            }}
+          >
+            <Popup>{popupContent}</Popup>
+          </Polyline>
+        </>
+      )}
+    </React.Fragment>
+  );
+})}
 
-                      {/* Circle marker at centroid — color by risk, size by accident count */}
-                      {centroid && (
-                        <CircleMarker
-                          center={centroid}
-                          radius={isSelected ? circleRadius + 3 : circleRadius}
-                          pathOptions={{
-                            color:       isSelected ? '#FFFFFF' : color,
-                            weight:      isSelected ? 3 : 1.5,
-                            fillColor:   color,
-                            fillOpacity: isSelected ? 0.95 : 0.75,
-                          }}
-                          eventHandlers={{
-                            click: () => fetchSegmentDetail(seg),
-                          }}
-                        >
-                          <Popup>{popupContent}</Popup>
-                        </CircleMarker>
-                      )}
-                    </React.Fragment>
-                  );
-                })}
               </MapContainer>
 
               {/* Map Legend Overlay */}

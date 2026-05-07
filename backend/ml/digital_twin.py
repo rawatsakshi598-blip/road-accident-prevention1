@@ -118,6 +118,11 @@ class DigitalTwin:
         logger.info("=" * 60)
         logger.info(f"BUILDING DIGITAL TWIN: {self.city_name}")
         logger.info(f"Using REAL Delhi Police Data via DelhiDataMapper")
+        if force_rebuild:
+            logger.info("FORCE REBUILD: All caches will be ignored")
+        else:
+            logger.info("CACHE-AWARE: Will use cached data where available")
+            logger.info("(Use force_rebuild=True to recompute everything from scratch)")
         logger.info("=" * 60)
 
         start_time = time.time()
@@ -206,8 +211,12 @@ class DigitalTwin:
         self.network_loader = RoadNetworkLoader(self.city_key)
 
         if force_rebuild or not self.network_loader.is_cache_valid():
+            if force_rebuild and self.network_loader.is_cache_valid():
+                logger.info("  Force rebuild: Ignoring cached road network")
+            logger.info("  Downloading road network from OpenStreetMap (1-5 min)...")
             self.road_network = self.network_loader.get_or_download_network()
         else:
+            logger.info("  Using cached road network (loaded in seconds)")
             self.road_network = self.network_loader.load_cached_network()
 
         self.edges_gdf = self.network_loader.get_edges_gdf()
@@ -219,9 +228,13 @@ class DigitalTwin:
         )
 
         if force_rebuild or not self.data_mapper.is_mapping_valid():
+            if force_rebuild and self.data_mapper.is_mapping_valid():
+                logger.info("  Force rebuild: Ignoring cached accident mapping")
+            logger.info("  Mapping accidents to road segments (2-5 min)...")
             self.segment_mapping = self.data_mapper.geocode_and_map_all()
             self.data_mapper.save_mapping(self.segment_mapping)
         else:
+            logger.info("  Using cached accident mapping (loaded in seconds)")
             self.segment_mapping = self.data_mapper.load_mapping()
 
         # Log virtual vs real segment counts
@@ -245,9 +258,67 @@ class DigitalTwin:
         )
 
         if force_rebuild or not self.risk_calculator.is_risks_valid():
+            if force_rebuild and self.risk_calculator.is_risks_valid():
+                logger.info("  Force rebuild: Ignoring cached risk scores")
+            logger.info("  Calculating risk scores from scratch...")
+            self.segment_risks = self.risk_calculator.calculate_all_segments()
+            self.risk_calculator.save_risks(self.segment_risks)# backend/ml/digital_twin.py
+
+        if force_rebuild or not self.network_loader.is_cache_valid():
+            if force_rebuild and self.network_loader.is_cache_valid():
+                logger.info("  Force rebuild: Ignoring cached road network")
+            logger.info("  Downloading road network from OpenStreetMap (1-5 min)...")
+            self.road_network = self.network_loader.get_or_download_network()
+        else:
+            logger.info("  Using cached road network (loaded in seconds)")
+            self.road_network = self.network_loader.load_cached_network()
+
+        self.edges_gdf = self.network_loader.get_edges_gdf()
+
+    def _build_accident_mapping(self, force_rebuild: bool):
+        """Step 2: Map REAL Delhi accidents to segments using DelhiDataMapper."""
+        self.data_mapper = DelhiDataMapper(
+            self.edges_gdf, self.city_key
+        )
+
+        if force_rebuild or not self.data_mapper.is_mapping_valid():
+            if force_rebuild and self.data_mapper.is_mapping_valid():
+                logger.info("  Force rebuild: Ignoring cached accident mapping")
+            logger.info("  Mapping accidents to road segments (2-5 min)...")
+            self.segment_mapping = self.data_mapper.geocode_and_map_all()
+            self.data_mapper.save_mapping(self.segment_mapping)
+        else:
+            logger.info("  Using cached accident mapping (loaded in seconds)")
+            self.segment_mapping = self.data_mapper.load_mapping()
+
+        # Log virtual vs real segment counts
+        virtual_count = sum(
+            1 for v in self.segment_mapping.values()
+            if v.get("is_virtual", False)
+        )
+        real_count = len(self.segment_mapping) - virtual_count
+
+        logger.info(
+            f"Accident mapping: {len(self.segment_mapping)} segments with accidents "
+            f"({real_count} real, {virtual_count} virtual)"
+        )
+
+    def _build_risk_scores(self, force_rebuild: bool):
+        """Step 3: Calculate risk scores."""
+        self.risk_calculator = SegmentRiskCalculator(
+            self.segment_mapping,
+            self.city_key,
+            self.predictor
+        )
+
+        if force_rebuild or not self.risk_calculator.is_risks_valid():
+            if force_rebuild and self.risk_calculator.is_risks_valid():
+                logger.info("  Force rebuild: Ignoring cached risk scores")
+            logger.info("  Calculating risk scores from scratch...")
             self.segment_risks = self.risk_calculator.calculate_all_segments()
             self.risk_calculator.save_risks(self.segment_risks)
         else:
+            logger.info("  Using cached risk scores (loaded in seconds)")
             self.segment_risks = self.risk_calculator.load_risks()
 
         # Enrich segment_risks with is_virtual and minor_count from segment_mapping
@@ -270,7 +341,37 @@ class DigitalTwin:
         )
 
         if force_rebuild or not self.heatmap_generator.is_heatmaps_valid():
+            print(json.dumps(metadata, indent=2))
+        else:
+            logger.info("  Using cached risk scores (loaded in seconds)")
+            self.segment_risks = self.risk_calculator.load_risks()
+
+        # Enrich segment_risks with is_virtual and minor_count from segment_mapping
+        for seg_id, risk_data in self.segment_risks.items():
+            mapping_data = self.segment_mapping.get(seg_id, {})
+
+            # Add is_virtual flag (from DelhiDataMapper)
+            risk_data["is_virtual"] = mapping_data.get("is_virtual", False)
+
+            # Add minor_count for API response
+            sev_dist = mapping_data.get("severity_distribution", {})
+            risk_data["minor_count"] = sev_dist.get("Minor", 0)
+
+    def _build_heatmaps(self, force_rebuild: bool):
+        """Step 4: Generate heatmaps."""
+        self.heatmap_generator = HeatmapGenerator(
+            self.edges_gdf,
+            self.segment_risks,
+            self.city_key
+        )
+
+        if force_rebuild or not self.heatmap_generator.is_heatmaps_valid():
+            if force_rebuild and self.heatmap_generator.is_heatmaps_valid():
+                logger.info("  Force rebuild: Ignoring cached heatmaps")
+            logger.info("  Generating heatmaps from scratch...")
             self.heatmap_generator.save_heatmaps()
+        else:
+            logger.info("  Using cached heatmaps (loaded in seconds)")
 
     def _initialize_simulator(self):
         """Initialize scenario simulator."""
@@ -533,8 +634,46 @@ class DigitalTwin:
         }
 
         if heatmap_type == "segments":
-            # Use API-formatted segment data
-            segments = self.get_segments_for_api(risk_threshold)
+            # Load full cached segment heatmap so frontend gets coordinates
+            segment_heatmap = self.get_heatmap_data("segments")
+
+            if isinstance(segment_heatmap, dict):
+                raw_segments = segment_heatmap.get("data", [])
+            else:
+                raw_segments = []
+
+            segments = []
+            for seg in raw_segments:
+                if not isinstance(seg, dict):
+                    continue
+
+                # Support both risk_score and composite_risk
+                score = seg.get("risk_score", seg.get("composite_risk", 0)) or 0
+                if score < risk_threshold:
+                    continue
+
+                seg = seg.copy()
+
+                # Ensure frontend-friendly fields exist
+                if "risk_score" not in seg or seg.get("risk_score") is None:
+                    seg["risk_score"] = round(float(score), 2)
+
+                if "composite_risk" not in seg or seg.get("composite_risk") is None:
+                    seg["composite_risk"] = round(float(score), 2)
+
+                if "color" not in seg or not seg.get("color"):
+                    seg["color"] = seg.get("risk_color", self._get_color_scale()[0]["color"])
+
+                if "risk_color" not in seg or not seg.get("risk_color"):
+                    seg["risk_color"] = seg["color"]
+
+                # coordinates should already be present in heatmap JSON,
+                # but keep a safe fallback if missing
+                if "coordinates" not in seg or not seg.get("coordinates"):
+                    seg["coordinates"] = []
+
+                segments.append(seg)
+
             response["type"] = "segments"
             response["data"] = segments
             response["segments_count"] = len(segments)

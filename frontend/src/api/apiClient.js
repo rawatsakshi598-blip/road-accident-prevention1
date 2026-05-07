@@ -2,8 +2,7 @@ import axios from 'axios';
 
 // API calls go to the same origin (through Caddy gateway or direct)
 // The Next.js API proxy routes /api/* to the Python backend on port 8000
-const API_BASE = '';
-
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000";
 const apiClient = axios.create({
   baseURL: API_BASE,
   timeout: 120000,

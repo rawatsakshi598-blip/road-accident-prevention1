@@ -1,0 +1,2294 @@
+===== routes_digital_twin.py =====
+# backend/api/routes_digital_twin.py
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
+from typing import Optional, List
+from datetime import datetime
+import logging
+
+from config import CITIES_CONFIG
+from ml.digital_twin import DigitalTwin
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# ROUTER
+# ─────────────────────────────────────────────
+router = APIRouter(prefix="/api/twin", tags=["Digital Twin"])
+
+# ─────────────────────────────────────────────
+# GLOBAL DIGITAL TWIN REGISTRY
+# (Loaded on startup, accessed by routes)
+# ─────────────────────────────────────────────
+digital_twins = {}
+
+
+def get_twin(city_key: str) -> DigitalTwin:
+    """
+    Get digital twin instance for a city.
+    
+    Args:
+        city_key: City identifier
+        
+    Returns:
+        DigitalTwin instance
+        
+    Raises:
+        HTTPException if twin not initialized
+    """
+    if city_key not in digital_twins:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Digital twin for '{city_key}' not initialized. "
+                   f"Call /api/twin/{city_key}/initialize first."
+        )
+    return digital_twins[city_key]
+
+
+# ─────────────────────────────────────────────
+# ENDPOINTS
+# ─────────────────────────────────────────────
+
+@router.get("/cities")
+async def list_cities():
+    """
+    List all available cities with their digital twin status.
+    """
+    cities = []
+    
+    for city_key, config in CITIES_CONFIG.items():
+        status = "not_initialized"
+        metadata = {}
+        
+        if city_key in digital_twins:
+            twin = digital_twins[city_key]
+            metadata = twin.get_metadata()
+            status = metadata.get("status", "unknown")
+        
+        cities.append({
+            "key": city_key,
+            "name": config["name"],
+            "display_name": config["display_name"],
+            "center": config["center"],
+            "zoom_level": config["zoom_level"],
+            "status": status,
+            "metadata": metadata,
+        })
+    
+    return {
+        "cities": cities,
+        "total_cities": len(cities),
+    }
+
+
+@router.get("/{city_key}/initialize")
+async def initialize_twin(
+    city_key: str,
+    force_rebuild: bool = Query(False, description="Force rebuild even if cache exists")
+):
+    """
+    Initialize or rebuild digital twin for a city.
+    
+    This will:
+    1. Download road network (if needed)
+    2. Map accidents to segments
+    3. Calculate risk scores
+    4. Generate heatmaps
+    
+    First time: 5-10 minutes
+    From cache: <10 seconds
+    """
+    if city_key not in CITIES_CONFIG:
+        raise HTTPException(
+            status_code=404,
+            detail=f"City '{city_key}' not found. "
+                   f"Available: {list(CITIES_CONFIG.keys())}"
+        )
+    
+    try:
+        logger.info(f"Initializing digital twin for {city_key}...")
+        
+        # Create twin instance
+        # Try to get predictor from global scope (if loaded)
+        predictor = None
+        try:
+            from main import predictor_instance
+            predictor = predictor_instance
+            logger.info("Using ML predictor for risk calculation")
+        except ImportError:
+            logger.warning(
+                "ML predictor not available. "
+                "Risk calculation will use historical data only."
+            )
+        
+        twin = DigitalTwin(city_key, predictor=predictor)
+        
+        # Build or load
+        metadata = twin.initialize_twin(force_rebuild=force_rebuild)
+        
+        # Store in global registry
+        digital_twins[city_key] = twin
+        
+        logger.info(f"Digital twin ready for {city_key}")
+        
+        return {
+            "status": "success",
+            "city": city_key,
+            "metadata": metadata,
+            "message": "Digital twin initialized successfully",
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize twin for {city_key}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Twin initialization failed: {str(e)}"
+        )
+
+
+@router.get("/{city_key}/metadata")
+async def get_twin_metadata(city_key: str):
+    """
+    Get metadata for a digital twin.
+    """
+    twin = get_twin(city_key)
+    
+    return {
+        "city": city_key,
+        "metadata": twin.get_metadata(),
+        "stats": twin.get_stats(),
+    }
+
+
+@router.get("/{city_key}/heatmap")
+async def get_heatmap(
+    city_key: str,
+    type: str = Query("segments", description="Heatmap type: 'grid' or 'segments'"),
+    risk_threshold: float = Query(0, description="Minimum risk threshold (0-100)")
+):
+    """
+    Get heatmap data for visualization.
+    
+    Types:
+    - grid: Regular grid with risk intensity (for heatmap.js)
+    - segments: Road segments with risk data, colors, and accident counts
+      
+    Segment response includes:
+    - segment_id, road_name, road_type, centroid_lat, centroid_lon
+    - total_accidents, fatal_count, grievous_count, minor_count
+    - composite_risk (0-100), risk_category, risk_color
+    - is_virtual (boolean for virtual segments from GPS points)
+    """
+    twin = get_twin(city_key)
+    
+    if type not in ["grid", "segments"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid type. Use 'grid' or 'segments'"
+        )
+    
+    try:
+        # Use the new API-formatted response method
+        heatmap_data = twin.get_heatmap_api_response(
+            heatmap_type=type,
+            risk_threshold=risk_threshold
+        )
+        
+        return heatmap_data
+        
+    except Exception as e:
+        logger.error(f"Heatmap generation failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate heatmap: {str(e)}"
+        )
+
+
+@router.get("/{city_key}/segments/top-dangerous")
+async def get_top_dangerous_segments(
+    city_key: str,
+    limit: int = Query(10, ge=1, le=100, description="Number of segments to return"),
+    min_risk: float = Query(60, ge=0, le=100, description="Minimum risk score")
+):
+    """
+    Get most dangerous road segments.
+    
+    Returns segments sorted by risk score (highest first).
+    """
+    twin = get_twin(city_key)
+    
+    try:
+        segments = twin.get_top_dangerous_segments(n=limit, min_risk=min_risk)
+        
+        return {
+            "city": city_key,
+            "segments": segments,
+            "count": len(segments),
+            "min_risk": min_risk,
+        }
+        
+    except Exception as e:
+        logger.error(f"Top dangerous query failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed: {str(e)}"
+        )
+
+
+@router.get("/{city_key}/segment/{segment_id}")
+async def get_segment_details(city_key: str, segment_id: str):
+    """
+    Get detailed information for a specific road segment.
+    
+    Includes:
+    - Road name, type, length
+    - Risk score and category
+    - Accident history
+    - Weather/time distributions
+    """
+    twin = get_twin(city_key)
+    
+    try:
+        segment_info = twin.get_segment_info(segment_id)
+        
+        if segment_info is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Segment '{segment_id}' not found"
+            )
+        
+        return {
+            "city": city_key,
+            "segment": segment_info,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Segment query failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed: {str(e)}"
+        )
+
+
+@router.post("/{city_key}/segment/{segment_id}/simulate")
+async def simulate_segment_scenario(
+    city_key: str,
+    segment_id: str,
+    scenario_type: str = Query(..., description="Scenario type: weather, time, traffic, intervention"),
+    weather: Optional[str] = Query(None, description="Weather condition"),
+    time_period: Optional[str] = Query(None, description="Time period"),
+    traffic_level: Optional[str] = Query(None, description="Traffic level"),
+    intervention_id: Optional[str] = Query(None, description="Intervention ID"),
+):
+    """
+    Simulate a scenario on a road segment.
+    
+    Scenario types:
+    - weather: Simulate different weather (requires weather param)
+    - time: Simulate different time of day (requires time_period param)
+    - traffic: Simulate different traffic level (requires traffic_level param)
+    - intervention: Simulate safety intervention (requires intervention_id param)
+    """
+    twin = get_twin(city_key)
+    
+    if not twin.scenario_simulator:
+        raise HTTPException(
+            status_code=503,
+            detail="Scenario simulator not available (ML predictor required)"
+        )
+    
+    try:
+        kwargs = {}
+        if weather:
+            kwargs["weather"] = weather
+        if time_period:
+            kwargs["time_period"] = time_period
+        if traffic_level:
+            kwargs["traffic_level"] = traffic_level
+        if intervention_id:
+            kwargs["intervention_id"] = intervention_id
+        
+        result = twin.simulate_scenario(
+            segment_id,
+            scenario_type,
+            **kwargs
+        )
+        
+        return {
+            "city": city_key,
+            "segment_id": segment_id,
+            "scenario_type": scenario_type,
+            "result": result,
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Simulation failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Simulation failed: {str(e)}"
+        )
+
+
+@router.post("/{city_key}/refresh")
+async def refresh_twin(city_key: str):
+    """
+    Rebuild digital twin with latest data.
+    
+    This will re-download road network, re-map accidents,
+    and recalculate all risks.
+    
+    Warning: Takes 5-10 minutes!
+    """
+    if city_key not in CITIES_CONFIG:
+        raise HTTPException(
+            status_code=404,
+            detail=f"City '{city_key}' not found"
+        )
+    
+    try:
+        logger.info(f"Refreshing digital twin for {city_key}...")
+        
+        # Get or create twin
+        if city_key in digital_twins:
+            twin = digital_twins[city_key]
+        else:
+            predictor = None
+            try:
+                from main import predictor_instance
+                predictor = predictor_instance
+            except ImportError:
+                pass
+            
+            twin = DigitalTwin(city_key, predictor=predictor)
+            digital_twins[city_key] = twin
+        
+        # Rebuild
+        metadata = twin.refresh_twin()
+        
+        return {
+            "status": "success",
+            "city": city_key,
+            "metadata": metadata,
+            "message": "Digital twin refreshed successfully",
+        }
+        
+    except Exception as e:
+        logger.error(f"Refresh failed for {city_key}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Refresh failed: {str(e)}"
+        )
+
+
+@router.get("/{city_key}/stats")
+async def get_twin_stats(city_key: str):
+    """
+    Get comprehensive statistics for a digital twin.
+    """
+    twin = get_twin(city_key)
+    
+    try:
+        stats = twin.get_stats()
+        
+        return {
+            "city": city_key,
+            "stats": stats,
+            "generated_at": datetime.now().isoformat(),
+        }
+        
+    except Exception as e:
+        logger.error(f"Stats query failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed: {str(e)}"
+        )
+===== heatmap_generator.py =====
+# backend/ml/heatmap_generator.py
+
+import os
+import json
+import logging
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+
+from config import (
+    DIGITAL_TWIN_DIR,
+    HEATMAP_GRID_SIZE,
+    RISK_CATEGORIES,
+    RISK_COLORS,
+    CITIES_CONFIG,
+)
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class HeatmapGenerator:
+    """
+    Generate heatmap data for risk visualization.
+
+    Produces two types of heatmaps:
+    1. Grid-based: Regular grid with risk intensity
+    2. Segment-based: Road segments colored by risk
+    """
+
+    def __init__(self, edges_gdf: gpd.GeoDataFrame,
+                 segment_risks: dict, city_key: str = "delhi"):
+        """
+        Initialize heatmap generator.
+
+        Args:
+            edges_gdf: GeoDataFrame of road network edges
+            segment_risks: Dict from SegmentRiskCalculator
+            city_key: City identifier
+        """
+        self.edges_gdf = edges_gdf.copy()
+        self.segment_risks = segment_risks
+        self.city_key = city_key
+        self.city_config = CITIES_CONFIG[city_key]
+
+        # Output paths
+        self.output_dir = os.path.join(DIGITAL_TWIN_DIR, city_key)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self.grid_heatmap_path = os.path.join(
+            self.output_dir, "heatmap_grid.json"
+        )
+        self.segment_heatmap_path = os.path.join(
+            self.output_dir, "heatmap_segments.json"
+        )
+        self.folium_map_path = os.path.join(
+            self.output_dir, "heatmap_test.html"
+        )
+
+        # Get bounding box
+        self.bbox = self.city_config["bbox"]
+        self.center = self.city_config["center"]
+
+        # Enrich edges with risk data
+        self._enrich_edges_with_risk()
+
+        logger.info(
+            f"HeatmapGenerator initialized for {city_key}: "
+            f"{len(segment_risks):,} segments with risk data"
+        )
+
+    def _enrich_edges_with_risk(self):
+        """
+        Add risk data to edges GeoDataFrame.
+        """
+        # Add segment_id if not present
+        # OSMnx stores u, v, key as MultiIndex NOT as columns
+        if "segment_id" not in self.edges_gdf.columns:
+            if "u" in self.edges_gdf.columns and "v" in self.edges_gdf.columns:
+                # u, v, key are regular columns
+                key_col = self.edges_gdf["key"] if "key" in self.edges_gdf.columns else pd.Series([0]*len(self.edges_gdf), index=self.edges_gdf.index)
+                self.edges_gdf["segment_id"] = (
+                    self.edges_gdf["u"].astype(str) + "_" +
+                    self.edges_gdf["v"].astype(str) + "_" +
+                    key_col.astype(str)
+                )
+            elif hasattr(self.edges_gdf.index, "names") and "u" in (self.edges_gdf.index.names or []):
+                # OSMnx default: (u, v, key) MultiIndex
+                self.edges_gdf["segment_id"] = [
+                    f"{u}_{v}_{k}"
+                    for u, v, k in self.edges_gdf.index
+                ]
+            else:
+                self.edges_gdf["segment_id"] = [
+                    f"seg_{i}" for i in range(len(self.edges_gdf))
+                ]
+
+        # Add risk columns
+        self.edges_gdf["risk_score"] = 0.0
+        self.edges_gdf["risk_category"] = "No Risk"
+        self.edges_gdf["risk_color"] = RISK_COLORS["No Risk"]
+
+        for idx, row in self.edges_gdf.iterrows():
+            segment_id = row["segment_id"]
+            if segment_id in self.segment_risks:
+                risk_data = self.segment_risks[segment_id]
+                self.edges_gdf.at[idx, "risk_score"] = risk_data.get(
+                    "composite_risk", 0
+                )
+                self.edges_gdf.at[idx, "risk_category"] = risk_data.get(
+                    "risk_category", "No Risk"
+                )
+                self.edges_gdf.at[idx, "risk_color"] = risk_data.get(
+                    "risk_color", RISK_COLORS["No Risk"]
+                )
+
+        logger.info("Edges enriched with risk data")
+
+    # ─────────────────────────────────────────
+    # GRID-BASED HEATMAP
+    # ─────────────────────────────────────────
+
+    def generate_grid_heatmap(self) -> list:
+        """
+        Generate grid-based heatmap data.
+
+        Creates a regular grid and samples risk from
+        nearby road segments.
+
+        Returns:
+            List of [lat, lon, intensity] for heatmap.js
+        """
+        logger.info("Generating grid-based heatmap...")
+
+        lat_min = self.bbox["lat_min"]
+        lat_max = self.bbox["lat_max"]
+        lon_min = self.bbox["lon_min"]
+        lon_max = self.bbox["lon_max"]
+
+        # Create grid
+        grid_size = HEATMAP_GRID_SIZE
+        lats = np.linspace(lat_min, lat_max, grid_size)
+        lons = np.linspace(lon_min, lon_max, grid_size)
+
+        # OPTIMIZATION: Only check segments with risk data (1,360 vs 24,399)
+        risk_segments = self.edges_gdf[
+            self.edges_gdf["segment_id"].isin(self.segment_risks.keys())
+        ].copy()
+
+        logger.info(f"Using {len(risk_segments)} segments with risk data for grid")
+
+        grid_points = []
+
+        # Sample risk at each grid point
+        total_points = grid_size * grid_size
+        processed = 0
+
+        for lat in lats:
+            for lon in lons:
+                processed += 1
+                if processed % 500 == 0:
+                    logger.info(f"Processing grid point {processed}/{total_points}...")
+
+                # Find nearby segments (within ~5km)
+                nearby_risks = []
+
+                # CHANGED: Only iterate over segments with accidents
+                for _, row in risk_segments.iterrows():
+                    # Get segment centroid
+                    centroid = row.get("geometry").centroid
+                    seg_lat = centroid.y
+                    seg_lon = centroid.x
+
+                    # Simple distance check (approximate)
+                    dist_lat = abs(seg_lat - lat)
+                    dist_lon = abs(seg_lon - lon)
+
+                    # ~0.05 degrees ≈ 5km
+                    if dist_lat < 0.05 and dist_lon < 0.05:
+                        nearby_risks.append(row["risk_score"])
+
+                # Average nearby risks (or use 0 if no segments nearby)
+                if nearby_risks:
+                    avg_risk = np.mean(nearby_risks)
+                else:
+                    avg_risk = 0.0
+
+                # Normalize to 0-1 for heatmap.js
+                intensity = avg_risk / 100.0
+
+                # Always add the point (even if 0)
+                grid_points.append([lat, lon, intensity])
+
+        logger.info(
+            f"Grid heatmap generated: {len(grid_points):,} points"
+        )
+        return grid_points
+
+    # ─────────────────────────────────────────
+    # SEGMENT-BASED HEATMAP
+    # ─────────────────────────────────────────
+
+    def generate_segment_heatmap(self) -> list:
+        """
+        Generate segment-based heatmap data.
+
+        Returns road segments with coordinates and colors.
+
+        Returns:
+            List of segment dicts for Leaflet Polylines
+        """
+        logger.info("Generating segment-based heatmap...")
+
+        segments = []
+
+        for idx, row in self.edges_gdf.iterrows():
+            try:
+                segment_id = row["segment_id"]
+                geometry = row["geometry"]
+                risk_score = row["risk_score"]
+                risk_category = row["risk_category"]
+                risk_color = row["risk_color"]
+
+                # Extract coordinates from LineString
+                coords = list(geometry.coords)
+                coords_list = [
+                    [round(lat, 6), round(lon, 6)]
+                    for lon, lat in coords
+                ]
+
+                # Road name
+                name = row.get("name", None)
+                if isinstance(name, list):
+                    name = name[0] if name else "Unknown Road"
+                elif not isinstance(name, str):
+                    name = "Unknown Road"
+
+                # Line weight based on risk
+                if risk_score >= 80:
+                    weight = 6
+                elif risk_score >= 60:
+                    weight = 5
+                elif risk_score >= 40:
+                    weight = 4
+                else:
+                    weight = 3
+
+                segment = {
+                    "segment_id": segment_id,
+                    "coordinates": coords_list,
+                    "risk_score": round(risk_score, 2),
+                    "risk_category": risk_category,
+                    "color": risk_color,
+                    "weight": weight,
+                    "road_name": str(name),
+                    "road_type": str(row.get("highway", "unknown")),
+                    "length_m": round(row.get("length", 0), 2),
+                }
+
+                # Add accident count if available
+                if segment_id in self.segment_risks:
+                    segment["total_accidents"] = self.segment_risks[
+                        segment_id
+                    ].get("total_accidents", 0)
+                else:
+                    segment["total_accidents"] = 0
+
+                segments.append(segment)
+
+            except Exception as e:
+                logger.debug(f"Segment {idx} skipped: {e}")
+                continue
+
+        logger.info(
+            f"Segment heatmap generated: {len(segments):,} segments"
+        )
+        return segments
+
+    # ─────────────────────────────────────────
+    # COLOR MAPPING
+    # ─────────────────────────────────────────
+
+    @staticmethod
+    def risk_to_color(risk_score: float) -> str:
+        """
+        Convert risk score to hex color.
+
+        Args:
+            risk_score: Risk score (0-100)
+
+        Returns:
+            Hex color string
+        """
+        for category, (low, high) in RISK_CATEGORIES.items():
+            if low <= risk_score < high:
+                return RISK_COLORS[category]
+
+        return RISK_COLORS["Very High"]
+
+    @staticmethod
+    def get_color_scale() -> list:
+        """
+        Get color scale for legend.
+
+        Returns:
+            List of (category, color, range) tuples
+        """
+        scale = []
+        for category in ["No Risk", "Low", "Moderate", "High", "Very High"]:
+            color = RISK_COLORS[category]
+            risk_range = RISK_CATEGORIES[category]
+            scale.append({
+                "category": category,
+                "color": color,
+                "range_min": risk_range[0],
+                "range_max": risk_range[1],
+            })
+        return scale
+
+    # ─────────────────────────────────────────
+    # FOLIUM MAP (FOR TESTING)
+    # ─────────────────────────────────────────
+
+    def create_folium_map(self) -> object:
+        """
+        Create interactive Folium map for testing.
+
+        Returns:
+            Folium Map object (requires folium installed)
+        """
+        try:
+            import folium
+            from folium.plugins import HeatMap
+        except ImportError:
+            logger.warning(
+                "Folium not available. Skipping map generation."
+            )
+            return None
+
+        logger.info("Creating Folium test map...")
+
+        # Create base map
+        m = folium.Map(
+            location=self.center,
+            zoom_start=self.city_config["zoom_level"],
+            tiles="OpenStreetMap",
+        )
+
+        # Add segment polylines
+        for idx, row in self.edges_gdf.iterrows():
+            if idx % 100 == 0 and idx > 0:
+                logger.info(f"Added {idx} segments to map...")
+
+            try:
+                geometry = row["geometry"]
+                coords = list(geometry.coords)
+                coords_list = [[lat, lon] for lon, lat in coords]
+
+                risk_score = row["risk_score"]
+                risk_color = row["risk_color"]
+
+                # Create popup
+                name = row.get("name", "Unknown")
+                if isinstance(name, list):
+                    name = name[0] if name else "Unknown Road"
+
+                popup_html = (
+                    "<b>" + str(name) + "</b><br>"
+                    "Risk: " + str(round(float(risk_score), 1)) + "<br>"
+                    "Category: " + str(row['risk_category']) + "<br>"
+                    "Type: " + str(row.get('highway', 'unknown'))
+                )
+
+                # Add polyline
+                folium.PolyLine(
+                    coords_list,
+                    color=risk_color,
+                    weight=4 if risk_score >= 60 else 2,
+                    opacity=0.7,
+                    popup=folium.Popup(popup_html, max_width=200),
+                ).add_to(m)
+
+            except Exception as e:
+                logger.debug(f"Segment {idx} skipped: {e}")
+                continue
+
+        # Add legend
+        legend_html = '''
+        <div style="position: fixed; 
+                    bottom: 50px; right: 50px; width: 180px; height: 200px; 
+                    background-color: white; border:2px solid grey; z-index:9999; 
+                    font-size:14px; padding: 10px">
+        <p style="margin:0;"><b>Risk Level</b></p>
+        <p style="margin:0;"><i class="fa fa-square" style="color:#ff0000"></i> Very High (80-100)</p>
+        <p style="margin:0;"><i class="fa fa-square" style="color:#ff8000"></i> High (60-80)</p>
+        <p style="margin:0;"><i class="fa fa-square" style="color:#ffff00"></i> Moderate (40-60)</p>
+        <p style="margin:0;"><i class="fa fa-square" style="color:#80ff00"></i> Low (20-40)</p>
+        <p style="margin:0;"><i class="fa fa-square" style="color:#00ff00"></i> Very Low (0-20)</p>
+        </div>
+        '''
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        logger.info("Folium map created")
+        return m
+
+    # ─────────────────────────────────────────
+    # EXPORT FOR LEAFLET
+    # ─────────────────────────────────────────
+
+    def export_for_leaflet(self) -> dict:
+        """
+        Export all heatmap data for React Leaflet.
+
+        Returns:
+            Dict with grid and segment heatmap data
+        """
+        logger.info("Exporting heatmap data for Leaflet...")
+
+        grid_data = self.generate_grid_heatmap()
+        segment_data = self.generate_segment_heatmap()
+
+        export_data = {
+            "city_key": self.city_key,
+            "city_name": self.city_config["name"],
+            "center": self.center,
+            "zoom_level": self.city_config["zoom_level"],
+            "bbox": self.bbox,
+            "grid_heatmap": grid_data,
+            "segment_heatmap": segment_data,
+            "color_scale": self.get_color_scale(),
+            "generated_at": datetime.now().isoformat(),
+            "grid_points_count": len(grid_data),
+            "segments_count": len(segment_data),
+        }
+
+        logger.info("Export data prepared")
+        return export_data
+
+    # ─────────────────────────────────────────
+    # SAVE / LOAD
+    # ─────────────────────────────────────────
+
+    def save_heatmaps(self):
+        """
+        Save all heatmap data to JSON files.
+        """
+        logger.info("Saving heatmap data...")
+
+        # Generate data
+        grid_data = self.generate_grid_heatmap()
+        segment_data = self.generate_segment_heatmap()
+
+        # Save grid heatmap
+        grid_export = {
+            "city_key": self.city_key,
+            "type": "grid",
+            "center": self.center,
+            "zoom_level": self.city_config["zoom_level"],
+            "grid_size": HEATMAP_GRID_SIZE,
+            "data": grid_data,
+            "generated_at": datetime.now().isoformat(),
+        }
+
+        with open(self.grid_heatmap_path, "w") as f:
+            json.dump(grid_export, f, indent=2)
+
+        grid_size_kb = os.path.getsize(self.grid_heatmap_path) / 1024
+        logger.info(
+            f"Grid heatmap saved: {self.grid_heatmap_path} "
+            f"({grid_size_kb:.1f} KB)"
+        )
+
+        # Save segment heatmap
+        segment_export = {
+            "city_key": self.city_key,
+            "type": "segments",
+            "center": self.center,
+            "zoom_level": self.city_config["zoom_level"],
+            "color_scale": self.get_color_scale(),
+            "data": segment_data,
+            "generated_at": datetime.now().isoformat(),
+        }
+
+        with open(self.segment_heatmap_path, "w") as f:
+            json.dump(segment_export, f, indent=2)
+
+        segment_size_kb = os.path.getsize(
+            self.segment_heatmap_path
+        ) / 1024
+        logger.info(
+            f"Segment heatmap saved: {self.segment_heatmap_path} "
+            f"({segment_size_kb:.1f} KB)"
+        )
+
+        # Save Folium test map (optional)
+        try:
+            m = self.create_folium_map()
+            if m is not None:
+                m.save(self.folium_map_path)
+                logger.info(
+                    f"Folium test map saved: {self.folium_map_path}"
+                )
+                logger.info(
+                    f"Open {self.folium_map_path} in browser to view"
+                )
+        except Exception as e:
+            logger.warning(f"Folium map generation failed: {e}")
+
+    def load_grid_heatmap(self) -> dict:
+        """Load grid heatmap from JSON."""
+        if not os.path.exists(self.grid_heatmap_path):
+            logger.warning(
+                f"No grid heatmap found at {self.grid_heatmap_path}"
+            )
+            return {}
+
+        with open(self.grid_heatmap_path, "r") as f:
+            data = json.load(f)
+
+        logger.info(
+            f"Grid heatmap loaded: {len(data.get('data', []))} points"
+        )
+        return data
+
+    def load_segment_heatmap(self) -> dict:
+        """Load segment heatmap from JSON."""
+        if not os.path.exists(self.segment_heatmap_path):
+            logger.warning(
+                f"No segment heatmap found at "
+                f"{self.segment_heatmap_path}"
+            )
+            return {}
+
+        with open(self.segment_heatmap_path, "r") as f:
+            data = json.load(f)
+
+        logger.info(
+            f"Segment heatmap loaded: "
+            f"{len(data.get('data', []))} segments"
+        )
+        return data
+
+    def is_heatmaps_valid(self) -> bool:
+        """Check if saved heatmaps exist."""
+        return (
+            os.path.exists(self.grid_heatmap_path) and
+            os.path.exists(self.segment_heatmap_path)
+        )
+===== segment_risk_calculator.py =====
+# backend/ml/segment_risk_calculator.py
+
+import os
+import json
+import logging
+from datetime import datetime
+
+import pandas as pd
+import numpy as np
+
+from config import (
+    DIGITAL_TWIN_DIR,
+    HISTORICAL_RISK_WEIGHT,
+    PREDICTIVE_RISK_WEIGHT,
+    RISK_CATEGORIES,
+    RISK_COLORS,
+    SEVERITY_CODE_MAP,
+)
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class SegmentRiskCalculator:
+    """
+    Calculate risk scores for road segments based on:
+    1. Historical accident data
+    2. ML model predictions (optional)
+    """
+
+    def __init__(self, segment_mapping: dict, city_key: str = "delhi",
+                 predictor=None):
+        """
+        Initialize risk calculator.
+
+        Args:
+            segment_mapping: Dict from AccidentSegmentMapper
+            city_key: City identifier
+            predictor: Optional AccidentPredictor instance
+                       for ML-based risk (can be None)
+        """
+        self.segment_mapping = segment_mapping
+        self.city_key = city_key
+        self.predictor = predictor
+
+        # Output paths
+        self.output_dir = os.path.join(DIGITAL_TWIN_DIR, city_key)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self.risks_path = os.path.join(
+            self.output_dir, "segment_risks.json"
+        )
+        self.risk_stats_path = os.path.join(
+            self.output_dir, "risk_stats.json"
+        )
+
+        # Results storage
+        self.segment_risks = {}
+        self.risk_stats = {}
+
+        logger.info(
+            f"SegmentRiskCalculator initialized for {city_key}: "
+            f"{len(segment_mapping):,} segments"
+        )
+
+    # ─────────────────────────────────────────
+    # HISTORICAL RISK CALCULATION
+    # ─────────────────────────────────────────
+
+    def calculate_historical_risk(self, segment_data: dict) -> float:
+        """
+        Calculate risk score based on accident history from REAL Delhi data.
+
+        Formula:
+        - Accident density (accidents per km per year)
+        - Weighted by severity (Fatal=10, Grievous=5, Minor=2, NoInjury=1)
+        - Fatality rate multiplier
+        - Year spread bonus (more years = more established pattern)
+        - Normalized to 0-100 scale
+
+        Args:
+            segment_data: Segment data dict with accidents
+
+        Returns:
+            Historical risk score (0-100)
+        """
+        total_accidents = segment_data.get("total_accidents", 0)
+
+        if total_accidents == 0:
+            return 0.0
+
+        # Segment length in km
+        length_m = segment_data.get("length_m", 100)
+        length_km = max(length_m / 1000, 0.01)
+
+        # Accident counts by severity
+        sev_dist = segment_data.get("severity_distribution", {})
+        fatal = sev_dist.get("Fatal", 0)
+        grievous = sev_dist.get("Grievous", 0)
+        minor = sev_dist.get("Minor", 0)
+        no_injury = sev_dist.get("No Injury", 0)
+
+        # Weighted severity score (higher weights for serious outcomes)
+        severity_weights = {
+            "Fatal": 10.0,
+            "Grievous": 5.0,
+            "Minor": 2.0,
+            "No Injury": 1.0,
+        }
+
+        weighted_accidents = (
+            fatal * severity_weights["Fatal"] +
+            grievous * severity_weights["Grievous"] +
+            minor * severity_weights["Minor"] +
+            no_injury * severity_weights["No Injury"]
+        )
+
+        # Determine years of data from year_distribution if available
+        year_dist = segment_data.get("year_distribution", {})
+        if year_dist and any(k != "unknown" and k != "" for k in year_dist.keys()):
+            distinct_years = len([k for k in year_dist.keys() if k and k != "unknown"])
+            years_of_data = max(distinct_years, 1)
+        else:
+            years_of_data = 5.0  # Delhi data spans 2016-2024
+
+        # Accident density per km per year
+        density = weighted_accidents / (length_km * years_of_data)
+
+        # Fatality rate multiplier (higher fatality = higher risk)
+        fatal_rate = segment_data.get("fatal_rate", 0)
+        fatality_multiplier = 1.0 + fatal_rate * 2.0  # Up to 3x for 100% fatality
+
+        # Apply multiplier
+        adjusted_density = density * fatality_multiplier
+
+        # Normalize to 0-100 scale
+        # Empirical scaling: adjusted_density > 30 → risk = 100
+        risk_score = min(100, (adjusted_density / 30) * 100)
+
+        return round(risk_score, 2)
+
+    # ─────────────────────────────────────────
+    # PREDICTIVE RISK CALCULATION
+    # ─────────────────────────────────────────
+
+    def calculate_predictive_risk(self, segment_data: dict) -> float:
+        """
+        Calculate risk using ML model predictions.
+
+        Uses the trained accident severity predictor
+        to predict risk for "typical" accident conditions
+        on this segment.
+
+        Args:
+            segment_data: Segment data dict
+
+        Returns:
+            Predictive risk score (0-100)
+            Returns 50 (moderate) if no predictor available
+        """
+        if self.predictor is None:
+            # No ML model available, return moderate risk
+            return 50.0
+
+        try:
+            # Create a "typical" accident scenario for this segment
+            # Based on most common conditions in segment history
+
+            # Most common weather
+            weather_dist = segment_data.get("weather_distribution", {})
+            most_common_weather = max(
+                weather_dist, key=weather_dist.get
+            ) if weather_dist else "Clear"
+
+            # Most common time period
+            time_dist = segment_data.get("time_distribution", {})
+            most_common_time = max(
+                time_dist, key=time_dist.get
+            ) if time_dist else "Afternoon"
+
+            # Road type
+            road_type = segment_data.get("road_type", "unknown")
+
+            # Create dummy input for prediction
+            # This would match your actual prediction input schema
+            dummy_input = {
+                "Day_of_Week": "Monday",
+                "Time_of_Accident": "12:00",
+                "Accident_Location": segment_data.get("road_name", "Unknown"),
+                "Nature_of_Accident": "Unknown",
+                "Causes_D1": "Other",
+                "Road_Condition": "Dry",
+                "Weather_Conditions": most_common_weather,
+                "Intersection_Type": "Unknown",
+                "Vehicle_Type_V1": "Car/Jeep/Van",
+                "Vehicle_Type_V2": "",
+                "Number_of_Vehicles": 2,
+            }
+
+            # Get prediction
+            result = self.predictor.predict(dummy_input)
+
+            # Extract severity probabilities
+            probabilities = result.get("probabilities", {})
+
+            # Calculate weighted risk from probability distribution
+            weighted_risk = (
+                probabilities.get("Fatal", 0) * 100 +
+                probabilities.get("Grievous", 0) * 75 +
+                probabilities.get("Minor", 0) * 50 +
+                probabilities.get("No Injury", 0) * 25
+            )
+
+            return round(weighted_risk, 2)
+
+        except Exception as e:
+            logger.debug(f"Predictive risk calculation failed: {e}")
+            return 50.0
+
+    # ─────────────────────────────────────────
+    # COMPOSITE RISK CALCULATION
+    # ─────────────────────────────────────────
+
+    def calculate_composite_risk(self, segment_data: dict) -> dict:
+        """
+        Calculate final composite risk score.
+
+        Combines historical and predictive risk using weights.
+
+        Args:
+            segment_data: Segment data dict
+
+        Returns:
+            Dict with all risk components
+        """
+        historical_risk = self.calculate_historical_risk(segment_data)
+        predictive_risk = self.calculate_predictive_risk(segment_data)
+
+        # Composite risk (weighted average)
+        composite_risk = (
+            HISTORICAL_RISK_WEIGHT * historical_risk +
+            PREDICTIVE_RISK_WEIGHT * predictive_risk
+        )
+
+        composite_risk = round(composite_risk, 2)
+
+        # Determine risk category
+        risk_category = "Moderate"
+        for category, (low, high) in RISK_CATEGORIES.items():
+            if low <= composite_risk < high:
+                risk_category = category
+                break
+
+        # Get risk color
+        risk_color = RISK_COLORS.get(risk_category, "#ffff00")
+
+        return {
+            "historical_risk": historical_risk,
+            "predictive_risk": predictive_risk,
+            "composite_risk": composite_risk,
+            "risk_category": risk_category,
+            "risk_color": risk_color,
+        }
+
+    # ─────────────────────────────────────────
+    # BATCH CALCULATION
+    # ─────────────────────────────────────────
+
+    def calculate_all_segments(self) -> dict:
+        """
+        Calculate risk scores for all segments.
+
+        Main entry point for risk calculation.
+
+        Returns:
+            Dict mapping segment_id to risk data
+        """
+        logger.info("=" * 50)
+        logger.info("Calculating segment risk scores...")
+        logger.info("=" * 50)
+
+        results = {}
+        risk_distribution = {
+            "No Risk": 0,
+            "Low": 0,
+            "Moderate": 0,
+            "High": 0,
+            "Very High": 0,
+        }
+
+        for idx, (segment_id, segment_data) in enumerate(
+            self.segment_mapping.items(), 1
+        ):
+            if idx % 100 == 0:
+                logger.info(f"Processed {idx:,} segments...")
+
+            try:
+                # Calculate risks
+                risk_data = self.calculate_composite_risk(segment_data)
+
+                # Combine with segment info
+                results[segment_id] = {
+                    "segment_id": segment_id,
+                    "road_name": segment_data.get("road_name", "Unknown"),
+                    "road_type": segment_data.get("road_type", "unknown"),
+                    "length_m": segment_data.get("length_m", 0),
+                    "centroid_lat": segment_data.get("centroid_lat", 0),
+                    "centroid_lon": segment_data.get("centroid_lon", 0),
+                    "total_accidents": segment_data.get("total_accidents", 0),
+                    "fatal_count": segment_data.get("severity_distribution", {}).get("Fatal", 0),
+                    "grievous_count": segment_data.get("severity_distribution", {}).get("Grievous", 0),
+                    **risk_data,
+                }
+
+                # Update distribution
+                category = risk_data["risk_category"]
+                risk_distribution[category] += 1
+
+            except Exception as e:
+                logger.warning(
+                    f"Risk calculation failed for segment {segment_id}: {e}"
+                )
+                continue
+
+        # Calculate statistics
+        risk_scores = [v["composite_risk"] for v in results.values()]
+        self.risk_stats = {
+            "total_segments": len(results),
+            "risk_distribution": risk_distribution,
+            "mean_risk": round(np.mean(risk_scores), 2) if risk_scores else 0,
+            "median_risk": round(np.median(risk_scores), 2) if risk_scores else 0,
+            "std_risk": round(np.std(risk_scores), 2) if risk_scores else 0,
+            "min_risk": round(min(risk_scores), 2) if risk_scores else 0,
+            "max_risk": round(max(risk_scores), 2) if risk_scores else 0,
+            "high_risk_segments": risk_distribution["High"] + risk_distribution["Very High"],
+            "calculated_at": datetime.now().isoformat(),
+        }
+
+        logger.info(
+            f"\nRisk calculation complete: {len(results):,} segments"
+        )
+        logger.info(f"Risk distribution: {risk_distribution}")
+        logger.info(
+            f"High/Very High risk segments: "
+            f"{self.risk_stats['high_risk_segments']:,}"
+        )
+
+        self.segment_risks = results
+        return results
+
+    # ─────────────────────────────────────────
+    # GET SEGMENT RISK
+    # ─────────────────────────────────────────
+
+    def get_segment_risk(self, segment_id: str) -> dict:
+        """
+        Get risk data for a specific segment.
+
+        Args:
+            segment_id: Segment identifier
+
+        Returns:
+            Risk data dict or None if not found
+        """
+        return self.segment_risks.get(segment_id, None)
+
+    def get_top_dangerous_segments(self, n: int = 10,
+                                    min_risk: float = 0) -> list:
+        """
+        Get N most dangerous segments.
+
+        Args:
+            n: Number of segments to return
+            min_risk: Minimum risk threshold
+
+        Returns:
+            List of segment risk dicts, sorted by risk (descending)
+        """
+        # Filter by minimum risk
+        filtered = [
+            seg for seg in self.segment_risks.values()
+            if seg["composite_risk"] >= min_risk
+        ]
+
+        # Sort by composite risk
+        sorted_segments = sorted(
+            filtered,
+            key=lambda x: x["composite_risk"],
+            reverse=True
+        )
+
+        return sorted_segments[:n]
+
+    def get_segments_by_category(self, category: str) -> list:
+        """
+        Get all segments in a specific risk category.
+
+        Args:
+            category: Risk category name
+                      ("Very Low", "Low", "Moderate", "High", "Very High")
+
+        Returns:
+            List of segment risk dicts
+        """
+        return [
+            seg for seg in self.segment_risks.values()
+            if seg["risk_category"] == category
+        ]
+
+    # ─────────────────────────────────────────
+    # SAVE / LOAD
+    # ─────────────────────────────────────────
+
+    def save_risks(self, risks: dict = None):
+        """
+        Save segment risks to JSON file.
+
+        Args:
+            risks: Risk dict to save (uses self.segment_risks if None)
+        """
+        if risks is None:
+            risks = self.segment_risks
+
+        with open(self.risks_path, "w") as f:
+            json.dump(risks, f, indent=2)
+
+        with open(self.risk_stats_path, "w") as f:
+            json.dump(self.risk_stats, f, indent=2)
+
+        size_kb = os.path.getsize(self.risks_path) / 1024
+        logger.info(
+            f"Risks saved: {self.risks_path} ({size_kb:.1f} KB)"
+        )
+        logger.info(f"Stats saved: {self.risk_stats_path}")
+
+    def load_risks(self) -> dict:
+        """
+        Load segment risks from JSON file.
+
+        Returns:
+            Risk dict or empty dict if not found
+        """
+        if not os.path.exists(self.risks_path):
+            logger.warning(f"No risks found at {self.risks_path}")
+            return {}
+
+        with open(self.risks_path, "r") as f:
+            risks = json.load(f)
+
+        if os.path.exists(self.risk_stats_path):
+            with open(self.risk_stats_path, "r") as f:
+                self.risk_stats = json.load(f)
+
+        logger.info(f"Risks loaded: {len(risks):,} segments")
+        self.segment_risks = risks
+        return risks
+
+    def is_risks_valid(self) -> bool:
+        """Check if saved risks exist."""
+        return os.path.exists(self.risks_path)
+
+    def get_stats(self) -> dict:
+        """Get risk statistics."""
+        if not self.risk_stats and os.path.exists(self.risk_stats_path):
+            with open(self.risk_stats_path, "r") as f:
+                self.risk_stats = json.load(f)
+        return self.risk_stats
+===== DigitalTwinPage.jsx =====
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { MapContainer, TileLayer, Polyline, CircleMarker, Popup, useMap } from 'react-leaflet';
+import { motion } from 'framer-motion';
+import {
+  FiMap, FiRefreshCw, FiAlertTriangle,
+  FiActivity, FiInfo, FiFilter, FiDatabase, FiLayers
+} from 'react-icons/fi';
+import toast from 'react-hot-toast';
+
+import { api } from '../api/apiClient';
+import { CITY_CENTERS } from '../utils/constants';
+import LoadingSpinner from '../components/common/LoadingSpinner';
+import KPICard from '../components/common/KPICard';
+import CitySelector from '../components/digital_twin/CitySelector';
+import StatisticsPanel from '../components/digital_twin/StatisticsPanel';
+import TopDangerousList from '../components/digital_twin/TopDangerousList';
+import SegmentDetailPanel from '../components/digital_twin/SegmentDetailPanel';
+import RiskLegend from '../components/digital_twin/RiskLegend';
+
+// ─── Performance cap ───────────────────────────────────────────────────────────
+const MAX_MAP_SEGMENTS = 800;
+
+// ─── Vibrant Color scheme per user requirements ────────────────────────────────
+// 0-10%   = Green   #22C55E  "Zero Accidents"
+// 10-40%  = Blue    #3B82F6  "Low Risk"
+// 40-60%  = Yellow  #EAB308  "Moderate Risk"
+// 60-80%  = Orange  #F97316  "High Risk"
+// 80-95%+ = Red     #EF4444  "Very High Risk"
+
+const RISK_LEVELS = [
+  { min: 0,  max: 10,  color: '#22C55E', label: 'Zero Accidents', shortLabel: 'Zero',   emoji: '🟢' },
+  { min: 10, max: 40,  color: '#3B82F6', label: 'Low Risk',       shortLabel: 'Low',    emoji: '🔵' },
+  { min: 40, max: 60,  color: '#EAB308', label: 'Moderate Risk',   shortLabel: 'Mod',    emoji: '🟡' },
+  { min: 60, max: 80,  color: '#F97316', label: 'High Risk',       shortLabel: 'High',   emoji: '🟠' },
+  { min: 80, max: 100, color: '#EF4444', label: 'Very High Risk',  shortLabel: 'V.High', emoji: '🔴' },
+];
+
+const getSegmentColor = (seg) => {
+  const score = seg.risk_score ?? 0;
+  if (score >= 80) return '#EF4444';   // Red - Very High Risk (80-95%+)
+  if (score >= 60) return '#F97316';   // Orange - High Risk (60-80%)
+  if (score >= 40) return '#EAB308';   // Yellow - Moderate Risk (40-60%)
+  if (score >= 10) return '#3B82F6';   // Blue - Low Risk (10-40%)
+  return '#22C55E';                     // Green - Zero Accidents (0-10%)
+};
+
+const getSegmentWeight = (seg) => {
+  if (seg.weight) return Math.min(seg.weight, 6);
+  const score = seg.risk_score ?? 0;
+  if (score >= 80) return 6;
+  if (score >= 60) return 5;
+  if (score >= 40) return 4;
+  if (score >= 10) return 3;
+  return 2;
+};
+
+const getRiskCategory = (score) => {
+  if (score >= 80) return 'Very High Risk';
+  if (score >= 60) return 'High Risk';
+  if (score >= 40) return 'Moderate Risk';
+  if (score >= 10) return 'Low Risk';
+  return 'Zero Accidents';
+};
+
+// ─── Compute centroid from polyline coordinates ────────────────────────────────
+const computeCentroid = (coords) => {
+  if (!coords || !Array.isArray(coords) || coords.length === 0) return null;
+  let latSum = 0, lngSum = 0, count = 0;
+  for (const pt of coords) {
+    if (Array.isArray(pt) && pt.length >= 2 && typeof pt[0] === 'number' && typeof pt[1] === 'number') {
+      latSum += pt[0];
+      lngSum += pt[1];
+      count++;
+    }
+  }
+  if (count === 0) return null;
+  return [latSum / count, lngSum / count];
+};
+
+// ─── Compute circle marker radius based on accident count ──────────────────────
+const getCircleRadius = (seg) => {
+  const accidents = seg.total_accidents ?? seg.accident_count ?? 0;
+  if (accidents === 0) return 4;
+  // Scale: min 5, max 18 for visual clarity
+  const radius = Math.max(5, Math.min(18, 5 + Math.log2(accidents + 1) * 2.5));
+  return radius;
+};
+
+// ─── Risk distribution computation ─────────────────────────────────────────────
+const computeRiskDistribution = (segments) => {
+  const dist = {
+    zero:  { count: 0, color: '#22C55E', label: 'Zero Accidents', range: '0-10%' },
+    low:   { count: 0, color: '#3B82F6', label: 'Low Risk',       range: '10-40%' },
+    mod:   { count: 0, color: '#EAB308', label: 'Moderate Risk',   range: '40-60%' },
+    high:  { count: 0, color: '#F97316', label: 'High Risk',       range: '60-80%' },
+    vhigh: { count: 0, color: '#EF4444', label: 'Very High Risk',  range: '80-95%+' },
+  };
+
+  for (const seg of segments) {
+    const score = seg.risk_score ?? 0;
+    if (score >= 80) dist.vhigh.count++;
+    else if (score >= 60) dist.high.count++;
+    else if (score >= 40) dist.mod.count++;
+    else if (score >= 10) dist.low.count++;
+    else dist.zero.count++;
+  }
+
+  return dist;
+};
+
+// ─── Map recenter ──────────────────────────────────────────────────────────────
+const MapRecenter = ({ center, zoom }) => {
+  const map = useMap();
+  useEffect(() => {
+    if (center && map) {
+      try { map.setView([center.lat, center.lng], zoom || 12); }
+      catch (e) { /* ignore */ }
+    }
+  }, [center, zoom, map]);
+  return null;
+};
+
+// ─── Map Legend Overlay (positioned on the map) ────────────────────────────────
+const MapLegendOverlay = () => (
+  <div
+    style={{
+      position: 'absolute',
+      bottom: 20,
+      left: 20,
+      zIndex: 1000,
+      background: 'rgba(15, 23, 42, 0.92)',
+      backdropFilter: 'blur(8px)',
+      border: '1px solid rgba(148, 163, 184, 0.2)',
+      borderRadius: 12,
+      padding: '12px 16px',
+      pointerEvents: 'auto',
+    }}
+  >
+    <p style={{ fontSize: 11, fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.05em', margin: '0 0 8px 0' }}>
+      Accident Risk Level
+    </p>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+      {RISK_LEVELS.map((level) => (
+        <div key={level.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div
+            style={{
+              width: 16,
+              height: 8,
+              borderRadius: 3,
+              backgroundColor: level.color,
+              flexShrink: 0,
+              boxShadow: `0 0 6px ${level.color}60`,
+            }}
+          />
+          <span style={{ fontSize: 11, color: '#E2E8F0', whiteSpace: 'nowrap' }}>
+            {level.label}
+          </span>
+          <span style={{ fontSize: 10, color: '#64748B', marginLeft: 'auto', fontFamily: 'monospace' }}>
+            {level.min === 0 ? '0' : level.min}-{level.max}%
+          </span>
+        </div>
+      ))}
+    </div>
+    <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(148, 163, 184, 0.15)' }}>
+      <p style={{ fontSize: 9, color: '#4ADE80', margin: 0 }}>
+        ✓ Based on REAL Delhi Police Data
+      </p>
+      <p style={{ fontSize: 9, color: '#64748B', margin: '2px 0 0 0' }}>
+        Circle size = accident count
+      </p>
+    </div>
+  </div>
+);
+
+// ─── Main Page ────────────────────────────────────────────────────────────────
+const DigitalTwinPage = () => {
+  const [cities,           setCities]           = useState([]);
+  const [selectedCity,     setSelectedCity]     = useState(null);
+  const [initializingCity, setInitializingCity] = useState(null);
+  const [segments,         setSegments]         = useState([]);
+  const [topDangerous,     setTopDangerous]     = useState([]);
+  const [stats,            setStats]            = useState(null);
+  const [metadata,         setMetadata]         = useState(null);
+  const [selectedSegment,  setSelectedSegment]  = useState(null);
+  const [detailSegment,    setDetailSegment]    = useState(null);
+  const [loading,          setLoading]          = useState(false);
+  const [mapLoading,       setMapLoading]       = useState(false);
+  const [riskFilter,       setRiskFilter]       = useState(0);
+  const [sidebarTab,       setSidebarTab]       = useState('stats');
+  const [mapKey,           setMapKey]           = useState('map-initial');
+  const [mapReady,         setMapReady]         = useState(false);
+
+  // ── load cities ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const fetchCities = async () => {
+      try {
+        const res = await api.twinCities();
+        const cityList = res.data?.cities || [];
+        setCities(cityList);
+        const ready = cityList.find((c) => c.status === 'ready');
+        if (ready) {
+          setSelectedCity(ready.key);
+          loadCityData(ready.key);
+        }
+      } catch (err) {
+        toast.error('Failed to load cities');
+        console.error(err);
+      }
+    };
+    fetchCities();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── load city data ───────────────────────────────────────────────────────────
+  const loadCityData = useCallback(async (cityKey) => {
+    if (!cityKey) return;
+    setMapLoading(true);
+    setMapReady(false);
+    setSegments([]);
+    setTopDangerous([]);
+    setStats(null);
+    setMetadata(null);
+    setDetailSegment(null);
+    setSelectedSegment(null);
+
+    try {
+      const [heatmapRes, statsRes, topRes] = await Promise.allSettled([
+        api.twinHeatmap(cityKey, 'segments', 0),
+        api.twinStats(cityKey),
+        api.twinTopDangerous(cityKey, 15, 0),
+      ]);
+
+      if (heatmapRes.status === 'fulfilled') {
+        const allSegs = heatmapRes.value.data?.data || [];
+        const sorted = [...allSegs].sort(
+          (a, b) => (b.risk_score ?? 0) - (a.risk_score ?? 0)
+        );
+        setSegments(sorted);
+        console.log(`Loaded ${sorted.length} segments for ${cityKey}`);
+      }
+      if (statsRes.status === 'fulfilled') {
+        const d = statsRes.value.data;
+        setStats(d.stats);
+        setMetadata(d.stats?.metadata);
+      }
+      if (topRes.status === 'fulfilled') {
+        setTopDangerous(topRes.value.data?.segments || []);
+      }
+    } catch (err) {
+      toast.error('Failed to load city data');
+      console.error(err);
+    } finally {
+      setMapLoading(false);
+      setTimeout(() => setMapReady(true), 300);
+    }
+  }, []);
+
+  // ── initialize twin ──────────────────────────────────────────────────────────
+  const handleInitialize = useCallback(async (cityKey) => {
+    setInitializingCity(cityKey);
+    toast('Building digital twin with REAL Delhi data... this may take 2-5 minutes.', { icon: '⏳', duration: 8000 });
+    try {
+      const res = await api.twinInitialize(cityKey, true);
+      if (res.data?.status === 'success') {
+        toast.success(`Digital twin for ${cityKey} is ready with real Delhi data!`);
+        const citiesRes = await api.twinCities();
+        setCities(citiesRes.data?.cities || []);
+        setSelectedCity(cityKey);
+        setMapKey(`map-${cityKey}-${Date.now()}`);
+        await loadCityData(cityKey);
+      }
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Initialization failed');
+    } finally {
+      setInitializingCity(null);
+    }
+  }, [loadCityData]);
+
+  // ── select city ──────────────────────────────────────────────────────────────
+  const handleCitySelect = useCallback((cityKey) => {
+    if (cityKey === selectedCity) return;
+    setSelectedCity(cityKey);
+    setSelectedSegment(null);
+    setDetailSegment(null);
+    setSidebarTab('stats');
+    setMapReady(false);
+    setMapKey(`map-${cityKey}-${Date.now()}`);
+    loadCityData(cityKey);
+  }, [loadCityData, selectedCity]);
+
+  // ── segment detail ───────────────────────────────────────────────────────────
+  const fetchSegmentDetail = useCallback(async (seg) => {
+    setSelectedSegment(seg.segment_id);
+    setSidebarTab('detail');
+    if (selectedCity) {
+      try {
+        const res = await api.twinSegmentDetails(selectedCity, seg.segment_id);
+        setDetailSegment(res.data?.segment || seg);
+      } catch {
+        setDetailSegment(seg);
+      }
+    } else {
+      setDetailSegment(seg);
+    }
+  }, [selectedCity]);
+
+  // ── refresh ──────────────────────────────────────────────────────────────────
+  const handleRefresh = useCallback(async () => {
+    if (!selectedCity) return;
+    setLoading(true);
+    try {
+      await api.twinRefresh(selectedCity);
+      toast.success('Twin refreshed with real data!');
+      setMapKey(`map-${selectedCity}-${Date.now()}`);
+      await loadCityData(selectedCity);
+    } catch {
+      toast.error('Refresh failed');
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedCity, loadCityData]);
+
+  // ── filtered + capped segments for map ───────────────────────────────────────
+  const filteredSegments = useMemo(() => {
+    const filtered = segments.filter((s) => (s.risk_score ?? 0) >= riskFilter);
+    if (selectedSegment) {
+      const sel = segments.find((s) => s.segment_id === selectedSegment);
+      if (sel && !filtered.find((s) => s.segment_id === sel.segment_id)) {
+        return [sel, ...filtered].slice(0, MAX_MAP_SEGMENTS);
+      }
+    }
+    return filtered.slice(0, MAX_MAP_SEGMENTS);
+  }, [segments, riskFilter, selectedSegment]);
+
+  const totalFiltered = useMemo(
+    () => segments.filter((s) => (s.risk_score ?? 0) >= riskFilter).length,
+    [segments, riskFilter]
+  );
+
+  // ── Risk distribution for stats ──────────────────────────────────────────────
+  const riskDistribution = useMemo(() => computeRiskDistribution(segments), [segments]);
+
+  // city center from backend data
+  const cityConfig   = cities.find((c) => c.key === selectedCity);
+  const cityCenter   = cityConfig?.center
+    ? { lat: cityConfig.center[0], lng: cityConfig.center[1] }
+    : CITY_CENTERS.delhi;
+  const cityZoom     = cityConfig?.zoom_level || 12;
+
+  // KPIs
+  const riskStats    = stats?.risk_statistics    || {};
+  const networkStats = stats?.network_statistics  || {};
+  const accStats     = stats?.accident_statistics || {};
+
+  // Computed stats for real data display
+  const totalAccidentsFromSegs = useMemo(
+    () => segments.reduce((sum, s) => sum + (s.total_accidents ?? s.accident_count ?? 0), 0),
+    [segments]
+  );
+
+  return (
+    <div className="space-y-5">
+      {/* Header */}
+      <motion.div
+        initial={{ opacity: 0, y: -10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="flex items-center justify-between flex-wrap gap-3"
+      >
+        <div>
+          <h1 className="text-xl font-bold text-white flex items-center gap-2">
+            <FiMap className="text-pbi-blue" />
+            Digital Twin — Delhi Road Network
+          </h1>
+          <p className="text-sm text-pbi-muted mt-0.5">
+            Real Delhi Police accident data mapped to road segments
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {selectedCity && (
+            <button
+              onClick={handleRefresh}
+              disabled={loading}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium
+                         bg-pbi-bg2 border border-pbi-border text-pbi-text2 hover:text-white
+                         transition-all duration-200 disabled:opacity-50"
+            >
+              <FiRefreshCw className={loading ? 'animate-spin' : ''} />
+              Refresh
+            </button>
+          )}
+        </div>
+      </motion.div>
+
+      {/* KPI Row */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <KPICard icon={<FiMap />}          value={networkStats.total_edges?.toLocaleString() ?? segments.length.toLocaleString() ?? '—'} label="Road Segments"    color="#3B82F6" delay={0}    />
+        <KPICard icon={<FiAlertTriangle />} value={accStats.total_accidents?.toLocaleString() ?? totalAccidentsFromSegs.toLocaleString()} label="Total Accidents"  color="#EF4444" delay={0.05} />
+        <KPICard icon={<FiActivity />}      value={riskStats.mean_risk != null ? `${riskStats.mean_risk.toFixed(1)}%` : '—'}             label="Avg Risk Score"   color="#EAB308" delay={0.1}  />
+        <KPICard icon={<FiAlertTriangle />} value={riskStats.high_risk_count?.toLocaleString() ?? '—'}                                   label="High Risk Segs"   color="#F97316" delay={0.15} subtext="Risk >= 60%" />
+      </div>
+
+      {/* Filter Controls */}
+      <div className="glass-card-static p-4 rounded-xl">
+        <div className="flex items-center gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <label className="text-xs text-pbi-muted whitespace-nowrap">
+              Show Risk ≥ <span className="text-white font-bold">{riskFilter}%</span>
+            </label>
+            <input
+              type="range" min={0} max={90} step={10}
+              value={riskFilter}
+              onChange={(e) => setRiskFilter(Number(e.target.value))}
+              className="w-28 accent-pbi-blue"
+            />
+          </div>
+
+          {/* Quick filter buttons with vibrant color scheme */}
+          <div className="flex gap-1.5 flex-wrap">
+            {[
+              { label: 'All',              value: 0,  col: 'text-pbi-muted'   },
+              { label: 'Low+ 10%',         value: 10, col: 'text-blue-400'    },
+              { label: 'Mod+ 40%',         value: 40, col: 'text-yellow-400'  },
+              { label: 'High 60%',         value: 60, col: 'text-orange-400'  },
+              { label: 'V.High 80%',       value: 80, col: 'text-red-400'    },
+            ].map((f) => (
+              <button
+                key={f.value}
+                onClick={() => setRiskFilter(f.value)}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-all
+                            ${riskFilter === f.value
+                              ? `${f.col} border-current bg-white/5`
+                              : 'border-pbi-border text-pbi-muted hover:text-white bg-pbi-bg2'}`}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Segment count */}
+          <div className="ml-auto text-xs text-pbi-muted">
+            {segments.length > 0 ? (
+              <>
+                Rendering{' '}
+                <span className="text-white font-bold">{filteredSegments.length}</span>
+                {totalFiltered > MAX_MAP_SEGMENTS && (
+                  <span className="text-pbi-yellow"> / {MAX_MAP_SEGMENTS} cap</span>
+                )}
+                {' '}of{' '}
+                <span className="text-white font-bold">{totalFiltered}</span> matching
+                {' '}({segments.length.toLocaleString()} total)
+              </>
+            ) : (
+              <span>No segments loaded</span>
+            )}
+          </div>
+        </div>
+
+        {/* Color scale - vibrant colors per spec */}
+        <div className="flex items-center gap-3 mt-3 flex-wrap">
+          {RISK_LEVELS.map((l) => (
+            <div key={l.label} className="flex items-center gap-1.5">
+              <div
+                className="w-6 h-2 rounded-sm"
+                style={{ backgroundColor: l.color, boxShadow: `0 0 4px ${l.color}50` }}
+              />
+              <span className="text-[10px] text-pbi-text2">{l.emoji} {l.label} ({l.min}-{l.max}%)</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Data source badge */}
+        <div className="mt-2 flex items-center gap-2">
+          <span className="text-[10px] text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded-full">
+            ✓ REAL Delhi Police Data
+          </span>
+          <span className="text-[10px] text-pbi-muted">
+            Source: delhiDatasets (2016-2024)
+          </span>
+        </div>
+
+        {/* Performance warning */}
+        {riskFilter === 0 && segments.length > 1000 && (
+          <p className="mt-2 text-xs text-pbi-yellow flex items-center gap-1">
+            ⚡ Showing top {MAX_MAP_SEGMENTS} of {segments.length.toLocaleString()} segments.
+            Use filters above to see specific risk levels.
+          </p>
+        )}
+      </div>
+
+      {/* Map + Sidebar */}
+      <div className="grid grid-cols-1 xl:grid-cols-[1fr_320px] gap-5">
+
+        {/* MAP */}
+        <div className="glass-card-static rounded-xl overflow-hidden" style={{ height: 560 }}>
+          {mapLoading ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3">
+              <LoadingSpinner text="Loading road segments..." />
+              <p className="text-xs text-pbi-muted">Processing {selectedCity} real accident data</p>
+            </div>
+          ) : !selectedCity ? (
+            <div className="flex flex-col items-center justify-center h-full gap-4">
+              <FiMap className="text-5xl text-pbi-muted" />
+              <p className="text-white font-semibold">Select a city to view road network</p>
+            </div>
+          ) : !mapReady ? (
+            <div className="flex items-center justify-center h-full">
+              <LoadingSpinner text="Preparing map..." />
+            </div>
+          ) : (
+            <div style={{ position: 'relative', height: '100%', width: '100%' }}>
+              <MapContainer
+                key={mapKey}
+                center={[cityCenter.lat, cityCenter.lng]}
+                zoom={cityZoom}
+                style={{ height: '100%', width: '100%' }}
+                preferCanvas={true}
+                zoomAnimation={false}
+                markerZoomAnimation={false}
+                updateWhenZooming={false}
+                updateWhenIdle={true}
+              >
+                <TileLayer
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                  maxZoom={19}
+                />
+                <MapRecenter center={cityCenter} zoom={cityZoom} />
+
+                {filteredSegments.map((seg, idx) => {
+                  const coords = seg.coordinates;
+                  const hasValidCoords = coords && Array.isArray(coords) && coords.length >= 2
+                    && coords[0] && coords[0].length >= 2
+                    && typeof coords[0][0] === 'number' && typeof coords[0][1] === 'number';
+
+                  const color       = getSegmentColor(seg);
+                  const weight      = getSegmentWeight(seg);
+                  const isSelected  = selectedSegment === seg.segment_id;
+                  const riskScore   = seg.risk_score ?? 0;
+                  const category    = seg.risk_category || getRiskCategory(riskScore);
+                  const accidents   = seg.total_accidents ?? seg.accident_count ?? 0;
+
+                  // Compute centroid for circle marker
+                  const centroid = seg.centroid
+                    ? (Array.isArray(seg.centroid) ? seg.centroid : [seg.centroid.lat ?? seg.centroid[0], seg.centroid.lng ?? seg.centroid[1]])
+                    : computeCentroid(coords);
+
+                  const circleRadius = getCircleRadius(seg);
+
+                  // Popup content shared by both polyline and circle marker
+                  const popupContent = (
+                    <div style={{ minWidth: 200, fontFamily: 'sans-serif' }}>
+                      <p style={{ fontWeight: 700, fontSize: 13, margin: '0 0 3px', color: '#111' }}>
+                        {seg.road_name || seg.name || 'Unnamed Road'}
+                      </p>
+                      <p style={{ fontSize: 11, color: '#666', margin: '0 0 6px' }}>
+                        {seg.road_type || seg.road_category || 'Unknown type'}
+                      </p>
+                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+                        <span style={{ fontSize: 11, color: '#666' }}>Risk Score</span>
+                        <span style={{ fontSize: 13, fontWeight: 700, color }}>
+                          {riskScore.toFixed(1)}%
+                        </span>
+                      </div>
+                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+                        <span style={{ fontSize: 11, color: '#666' }}>Category</span>
+                        <span style={{ fontSize: 11, fontWeight: 600, color }}>
+                          {category}
+                        </span>
+                      </div>
+                      {accidents > 0 && (
+                        <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+                          <span style={{ fontSize: 11, color: '#666' }}>Accidents</span>
+                          <span style={{ fontSize: 11, fontWeight: 600, color: '#333' }}>
+                            {accidents}
+                          </span>
+                        </div>
+                      )}
+                      {seg.length_m != null && (
+                        <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 3 }}>
+                          <span style={{ fontSize: 11, color: '#666' }}>Length</span>
+                          <span style={{ fontSize: 11, color: '#333' }}>
+                            {(seg.length_m / 1000).toFixed(2)} km
+                          </span>
+                        </div>
+                      )}
+                      {seg.segment_id && (
+                        <div style={{ display:'flex', justifyContent:'space-between' }}>
+                          <span style={{ fontSize: 11, color: '#666' }}>Segment ID</span>
+                          <span style={{ fontSize: 10, color: '#999', fontFamily: 'monospace' }}>
+                            {seg.segment_id}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+
+                  return (
+                    <React.Fragment key={seg.segment_id || `seg-${idx}`}>
+                      {/* Polyline for road segment */}
+                      {hasValidCoords && (
+                        <Polyline
+                          positions={coords}
+                          pathOptions={{
+                            color:   isSelected ? '#60A5FA' : color,
+                            weight:  isSelected ? weight + 3 : weight,
+                            opacity: isSelected ? 1.0 : 0.85,
+                          }}
+                          eventHandlers={{
+                            click: () => fetchSegmentDetail(seg),
+                          }}
+                        >
+                          <Popup>{popupContent}</Popup>
+                        </Polyline>
+                      )}
+
+                      {/* Circle marker at centroid — color by risk, size by accident count */}
+                      {centroid && (
+                        <CircleMarker
+                          center={centroid}
+                          radius={isSelected ? circleRadius + 3 : circleRadius}
+                          pathOptions={{
+                            color:       isSelected ? '#FFFFFF' : color,
+                            weight:      isSelected ? 3 : 1.5,
+                            fillColor:   color,
+                            fillOpacity: isSelected ? 0.95 : 0.75,
+                          }}
+                          eventHandlers={{
+                            click: () => fetchSegmentDetail(seg),
+                          }}
+                        >
+                          <Popup>{popupContent}</Popup>
+                        </CircleMarker>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </MapContainer>
+
+              {/* Map Legend Overlay */}
+              <MapLegendOverlay />
+            </div>
+          )}
+        </div>
+
+        {/* SIDEBAR */}
+        <div className="flex flex-col gap-4">
+          <CitySelector
+            cities={cities}
+            selectedCity={selectedCity}
+            onSelect={handleCitySelect}
+            onInitialize={handleInitialize}
+            initializingCity={initializingCity}
+          />
+
+          {selectedCity && (
+            <div className="flex gap-1 bg-pbi-bg2 rounded-lg p-1">
+              {[
+                { id: 'stats',  label: 'Stats',   icon: <FiActivity /> },
+                { id: 'top',    label: 'Top Risk', icon: <FiAlertTriangle /> },
+                { id: 'detail', label: 'Segment',  icon: <FiInfo /> },
+              ].map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setSidebarTab(tab.id)}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-2
+                              rounded-md text-xs font-medium transition-all duration-200
+                              ${sidebarTab === tab.id
+                                ? 'bg-pbi-blue text-white shadow'
+                                : 'text-pbi-muted hover:text-white'}`}
+                >
+                  {tab.icon}
+                  <span className="hidden sm:inline">{tab.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {selectedCity && (
+            <>
+              {sidebarTab === 'stats' && (
+                <>
+                  <StatisticsPanel stats={stats} metadata={metadata} />
+
+                  {/* Risk Distribution Panel — 5 categories */}
+                  <div className="glass-card-static p-4 rounded-xl">
+                    <h4 className="text-xs font-semibold text-pbi-muted uppercase tracking-wider mb-3 flex items-center gap-2">
+                      <FiLayers className="text-pbi-blue" />
+                      Risk Distribution
+                    </h4>
+                    {segments.length > 0 ? (
+                      <>
+                        {/* Distribution bar */}
+                        <div className="flex h-3 rounded-full overflow-hidden gap-0.5 mb-2">
+                          {Object.values(riskDistribution).map((cat) => {
+                            const pct = segments.length > 0 ? (cat.count / segments.length) * 100 : 0;
+                            return pct > 0 ? (
+                              <div
+                                key={cat.label}
+                                className="h-full transition-all"
+                                style={{
+                                  width: `${pct}%`,
+                                  backgroundColor: cat.color,
+                                  minWidth: pct > 0 ? 2 : 0,
+                                }}
+                                title={`${cat.label}: ${cat.count} (${pct.toFixed(1)}%)`}
+                              />
+                            ) : null;
+                          })}
+                        </div>
+
+                        {/* Category breakdown */}
+                        <div className="space-y-2 mt-3">
+                          {Object.values(riskDistribution).map((cat) => {
+                            const pct = segments.length > 0 ? (cat.count / segments.length) * 100 : 0;
+                            return (
+                              <div key={cat.label} className="flex items-center gap-2">
+                                <div
+                                  className="w-3 h-3 rounded-sm flex-shrink-0"
+                                  style={{ backgroundColor: cat.color }}
+                                />
+                                <span className="text-xs text-white flex-1">{cat.label}</span>
+                                <span className="text-xs text-pbi-text2 font-mono">
+                                  {cat.count.toLocaleString()}
+                                </span>
+                                <span className="text-[10px] text-pbi-muted font-mono w-12 text-right">
+                                  {pct.toFixed(1)}%
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-xs text-pbi-muted text-center py-3">
+                        Load segments to see distribution
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Real Data Stats Panel */}
+                  <div className="glass-card-static p-4 rounded-xl">
+                    <h4 className="text-xs font-semibold text-pbi-muted uppercase tracking-wider mb-3 flex items-center gap-2">
+                      <FiDatabase className="text-emerald-400" />
+                      Data Overview
+                    </h4>
+                    <div className="space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-pbi-muted">Total Segments Mapped</span>
+                        <span className="text-xs text-white font-bold">
+                          {segments.length.toLocaleString()}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-pbi-muted">Total Accidents</span>
+                        <span className="text-xs text-white font-bold">
+                          {(accStats.total_accidents ?? totalAccidentsFromSegs)?.toLocaleString?.() ?? '—'}
+                        </span>
+                      </div>
+                      {accStats.mapped_accidents != null && (
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-pbi-muted">Mapped Accidents</span>
+                          <span className="text-xs text-white font-bold">
+                            {accStats.mapped_accidents.toLocaleString()}
+                          </span>
+                        </div>
+                      )}
+                      {accStats.match_rate != null && (
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-pbi-muted">Match Rate</span>
+                          <span className="text-xs text-emerald-400 font-bold">
+                            {(accStats.match_rate * 100).toFixed(1)}%
+                          </span>
+                        </div>
+                      )}
+                      {/* Dataset breakdown from metadata */}
+                      {metadata?.dataset_breakdown && (
+                        <div className="pt-2 mt-1 border-t border-pbi-border">
+                          <p className="text-[10px] text-pbi-muted uppercase tracking-wider mb-1.5">Dataset Breakdown</p>
+                          {Object.entries(metadata.dataset_breakdown).map(([dsKey, dsVal]) => (
+                            <div key={dsKey} className="flex items-center justify-between py-0.5">
+                              <span className="text-xs text-pbi-text2">{dsKey}</span>
+                              <span className="text-xs text-white font-mono">
+                                {typeof dsVal === 'number' ? dsVal.toLocaleString() : String(dsVal)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {/* Virtual vs Real segment counts */}
+                      {metadata && (metadata.virtual_segments != null || metadata.real_segments != null) && (
+                        <div className="pt-2 mt-1 border-t border-pbi-border">
+                          <p className="text-[10px] text-pbi-muted uppercase tracking-wider mb-1.5">Segment Origin</p>
+                          {metadata.real_segments != null && (
+                            <div className="flex items-center justify-between py-0.5">
+                              <span className="text-xs text-blue-400">Real Segments</span>
+                              <span className="text-xs text-white font-mono">
+                                {metadata.real_segments.toLocaleString()}
+                              </span>
+                            </div>
+                          )}
+                          {metadata.virtual_segments != null && (
+                            <div className="flex items-center justify-between py-0.5">
+                              <span className="text-xs text-purple-400">Virtual Segments</span>
+                              <span className="text-xs text-white font-mono">
+                                {metadata.virtual_segments.toLocaleString()}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <RiskLegend />
+                </>
+              )}
+              {sidebarTab === 'top' && (
+                <TopDangerousList
+                  segments={topDangerous}
+                  onSelectSegment={fetchSegmentDetail}
+                  selectedSegmentId={selectedSegment}
+                  loading={mapLoading}
+                />
+              )}
+              {sidebarTab === 'detail' && (
+                <SegmentDetailPanel
+                  segment={detailSegment}
+                  onClose={() => {
+                    setDetailSegment(null);
+                    setSelectedSegment(null);
+                    setSidebarTab('stats');
+                  }}
+                  onSimulate={() => {
+                    toast('Go to Simulation page to run scenarios', { icon: '🔬' });
+                  }}
+                />
+              )}
+            </>
+          )}
+
+          {!selectedCity && (
+            <div className="glass-card-static rounded-xl p-6 text-center">
+              <FiMap className="text-3xl text-pbi-muted mx-auto mb-3" />
+              <p className="text-sm text-white font-medium">Select a city to begin</p>
+              <p className="text-xs text-pbi-muted mt-1">
+                Initialize a digital twin to view the risk heatmap
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default DigitalTwinPage;

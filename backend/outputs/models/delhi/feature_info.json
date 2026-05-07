@@ -1,0 +1,28 @@
+{
+  "feature_names": [
+    "total_accidents",
+    "fatal_count",
+    "grievous_count",
+    "minor_count",
+    "fatal_rate",
+    "accident_density",
+    "weighted_severity",
+    "length_m",
+    "num_years",
+    "year_span",
+    "day_accident_ratio",
+    "is_highway",
+    "is_urban",
+    "is_intersection",
+    "is_virtual"
+  ],
+  "label_mapping": {
+    "0": "High",
+    "1": "Low",
+    "2": "Medium"
+  },
+  "n_features": 15,
+  "n_classes": 3,
+  "dataset": "delhi",
+  "source": "segment_mapping"
+}

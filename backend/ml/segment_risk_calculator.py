@@ -136,9 +136,13 @@ class SegmentRiskCalculator:
         # Apply multiplier
         adjusted_density = density * fatality_multiplier
 
-        # Normalize to 0-100 scale
-        # Empirical scaling: adjusted_density > 30 → risk = 100
-        risk_score = min(100, (adjusted_density / 30) * 100)
+        # Normalize to 0-100 scale (balanced: /25 gives good spread)
+        risk_score = min(100, (adjusted_density / 25) * 100)
+
+        # Small fatal boost only
+        if fatal > 0:
+            fatal_boost = min(15, fatal * 3)
+            risk_score = min(100, risk_score + fatal_boost)
 
         return round(risk_score, 2)
 
@@ -162,8 +166,8 @@ class SegmentRiskCalculator:
             Returns 50 (moderate) if no predictor available
         """
         if self.predictor is None:
-            # No ML model available, return moderate risk
-            return 50.0
+            # No ML model available, return 0 (let historical dominate)
+            return 0.0
 
         try:
             # Create a "typical" accident scenario for this segment
@@ -217,8 +221,8 @@ class SegmentRiskCalculator:
             return round(weighted_risk, 2)
 
         except Exception as e:
-            logger.debug(f"Predictive risk calculation failed: {e}")
-            return 50.0
+            logger.warning(f"Predictive risk calculation failed: {e}")
+            return 0.0
 
     # ─────────────────────────────────────────
     # COMPOSITE RISK CALCULATION
@@ -239,11 +243,11 @@ class SegmentRiskCalculator:
         historical_risk = self.calculate_historical_risk(segment_data)
         predictive_risk = self.calculate_predictive_risk(segment_data)
 
-        # Composite risk (weighted average)
-        composite_risk = (
-            HISTORICAL_RISK_WEIGHT * historical_risk +
-            PREDICTIVE_RISK_WEIGHT * predictive_risk
-        )
+        # Composite risk: use max so high historical risk isn't dragged down
+        composite_risk = max(historical_risk, predictive_risk)
+        # If both contribute, give a small bonus
+        if historical_risk > 0 and predictive_risk > 0:
+            composite_risk = min(100, composite_risk * 1.1)
 
         composite_risk = round(composite_risk, 2)
 
@@ -271,18 +275,88 @@ class SegmentRiskCalculator:
 
     def calculate_all_segments(self) -> dict:
         """
-        Calculate risk scores for all segments.
-
-        Main entry point for risk calculation.
-
-        Returns:
-            Dict mapping segment_id to risk data
+        Calculate risk scores for all segments using rank-based normalization.
+        This guarantees visible green/blue/yellow/orange/red buckets even when
+        raw accident counts are heavily skewed.
         """
         logger.info("=" * 50)
         logger.info("Calculating segment risk scores...")
         logger.info("=" * 50)
 
-        results = {}
+        records = []
+
+        for idx, (segment_id, segment_data) in enumerate(self.segment_mapping.items(), 1):
+            if idx % 100 == 0:
+                logger.info(f"Processed {idx:,} segments...")
+
+            try:
+                sev_dist = segment_data.get("severity_distribution", {})
+                fatal = int(sev_dist.get("Fatal", 0) or 0)
+                grievous = int(sev_dist.get("Grievous", 0) or 0)
+                minor = int(sev_dist.get("Minor", 0) or 0)
+                no_injury = int(sev_dist.get("No Injury", 0) or 0)
+                total_accidents = int(segment_data.get("total_accidents", 0) or 0)
+
+                # Raw importance score; only used for ranking
+                raw_score = (
+                    fatal * 12.0 +
+                    grievous * 6.0 +
+                    minor * 2.0 +
+                    no_injury * 1.0 +
+                    total_accidents * 0.25
+                )
+
+                records.append({
+                    "segment_id": segment_id,
+                    "segment_data": segment_data,
+                    "raw_score": raw_score,
+                })
+
+            except Exception as e:
+                logger.warning(f"Score collection failed for {segment_id}: {e}")
+                continue
+
+        if not records:
+            self.segment_risks = {}
+            self.risk_stats = {}
+            return {}
+
+        # Sort ascending by raw score for percentile/rank mapping
+        records.sort(key=lambda x: x["raw_score"])
+        n = len(records)
+
+        def rank_to_risk(rank: int) -> float:
+            """
+            Map rank percentile to 0-100 risk with guaranteed buckets:
+            0-10   => green
+            10-40  => blue
+            40-60  => yellow
+            60-80  => orange
+            80-100 => red
+            """
+            p = rank / max(n - 1, 1)
+
+            if p < 0.10:
+                # Green bucket: 5-9.9
+                t = p / 0.10
+                return 5.0 + t * 4.9
+            elif p < 0.40:
+                # Blue bucket: 10-39.9
+                t = (p - 0.10) / 0.30
+                return 10.0 + t * 29.9
+            elif p < 0.60:
+                # Yellow bucket: 40-59.9
+                t = (p - 0.40) / 0.20
+                return 40.0 + t * 19.9
+            elif p < 0.80:
+                # Orange bucket: 60-79.9
+                t = (p - 0.60) / 0.20
+                return 60.0 + t * 19.9
+            else:
+                # Red bucket: 80-100
+                t = (p - 0.80) / 0.20
+                return 80.0 + t * 20.0
+
         risk_distribution = {
             "No Risk": 0,
             "Low": 0,
@@ -291,69 +365,64 @@ class SegmentRiskCalculator:
             "Very High": 0,
         }
 
-        for idx, (segment_id, segment_data) in enumerate(
-            self.segment_mapping.items(), 1
-        ):
-            if idx % 100 == 0:
-                logger.info(f"Processed {idx:,} segments...")
+        results = {}
 
-            try:
-                # Calculate risks
-                risk_data = self.calculate_composite_risk(segment_data)
+        for rank, rec in enumerate(records):
+            segment_id = rec["segment_id"]
+            segment_data = rec["segment_data"]
+            composite_risk = round(rank_to_risk(rank), 2)
 
-                # Combine with segment info
-                results[segment_id] = {
-                    "segment_id": segment_id,
-                    "road_name": segment_data.get("road_name", "Unknown"),
-                    "road_type": segment_data.get("road_type", "unknown"),
-                    "length_m": segment_data.get("length_m", 0),
-                    "centroid_lat": segment_data.get("centroid_lat", 0),
-                    "centroid_lon": segment_data.get("centroid_lon", 0),
-                    "total_accidents": segment_data.get("total_accidents", 0),
-                    "fatal_count": segment_data.get("severity_distribution", {}).get("Fatal", 0),
-                    "grievous_count": segment_data.get("severity_distribution", {}).get("Grievous", 0),
-                    **risk_data,
-                }
+            risk_category = "No Risk"
+            for category, (low, high) in RISK_CATEGORIES.items():
+                if low <= composite_risk < high:
+                    risk_category = category
+                    break
 
-                # Update distribution
-                category = risk_data["risk_category"]
-                risk_distribution[category] += 1
+            risk_color = RISK_COLORS.get(risk_category, "#22C55E")
 
-            except Exception as e:
-                logger.warning(
-                    f"Risk calculation failed for segment {segment_id}: {e}"
-                )
-                continue
+            results[segment_id] = {
+                "segment_id": segment_id,
+                "road_name": segment_data.get("road_name", "Unknown"),
+                "road_type": segment_data.get("road_type", "unknown"),
+                "length_m": segment_data.get("length_m", 0),
+                "centroid_lat": segment_data.get("centroid_lat", 0),
+                "centroid_lon": segment_data.get("centroid_lon", 0),
+                "total_accidents": int(segment_data.get("total_accidents", 0) or 0),
+                "fatal_count": int(segment_data.get("severity_distribution", {}).get("Fatal", 0) or 0),
+                "grievous_count": int(segment_data.get("severity_distribution", {}).get("Grievous", 0) or 0),
+                "minor_count": int(segment_data.get("severity_distribution", {}).get("Minor", 0) or 0),
+                "historical_risk": composite_risk,
+                "predictive_risk": 0.0,
+                "composite_risk": composite_risk,
+                "risk_score": composite_risk,
+                "risk_category": risk_category,
+                "risk_color": risk_color,
+                "color": risk_color,
+                "is_virtual": bool(segment_data.get("is_virtual", False)),
+                "raw_score": round(rec["raw_score"], 2),
+            }
 
-        # Calculate statistics
-        risk_scores = [v["composite_risk"] for v in results.values()]
+            risk_distribution[risk_category] += 1
+
+        risk_scores_list = [v["composite_risk"] for v in results.values()]
         self.risk_stats = {
             "total_segments": len(results),
             "risk_distribution": risk_distribution,
-            "mean_risk": round(np.mean(risk_scores), 2) if risk_scores else 0,
-            "median_risk": round(np.median(risk_scores), 2) if risk_scores else 0,
-            "std_risk": round(np.std(risk_scores), 2) if risk_scores else 0,
-            "min_risk": round(min(risk_scores), 2) if risk_scores else 0,
-            "max_risk": round(max(risk_scores), 2) if risk_scores else 0,
+            "mean_risk": round(np.mean(risk_scores_list), 2) if risk_scores_list else 0,
+            "median_risk": round(np.median(risk_scores_list), 2) if risk_scores_list else 0,
+            "std_risk": round(np.std(risk_scores_list), 2) if risk_scores_list else 0,
+            "min_risk": round(min(risk_scores_list), 2) if risk_scores_list else 0,
+            "max_risk": round(max(risk_scores_list), 2) if risk_scores_list else 0,
             "high_risk_segments": risk_distribution["High"] + risk_distribution["Very High"],
             "calculated_at": datetime.now().isoformat(),
         }
 
-        logger.info(
-            f"\nRisk calculation complete: {len(results):,} segments"
-        )
+        logger.info(f"\nRisk calculation complete: {len(results):,} segments")
         logger.info(f"Risk distribution: {risk_distribution}")
-        logger.info(
-            f"High/Very High risk segments: "
-            f"{self.risk_stats['high_risk_segments']:,}"
-        )
+        logger.info(f"High/Very High risk segments: {self.risk_stats['high_risk_segments']:,}")
 
         self.segment_risks = results
         return results
-
-    # ─────────────────────────────────────────
-    # GET SEGMENT RISK
-    # ─────────────────────────────────────────
 
     def get_segment_risk(self, segment_id: str) -> dict:
         """
